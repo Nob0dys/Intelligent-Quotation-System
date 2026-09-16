@@ -813,7 +813,10 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
                 values["税后总价"] = round(tax_unit * quantity, 2) if quantity else ""
                 values["品牌"] = _option_field(primary, "brand")
                 values["制造商"] = _option_field(primary, "manufacturer")
-                values["型号"] = normalize_standard_code(_option_field(primary, "product_code"))
+                # “型号”优先取产品编码；历史记录没有编码时回填型号字段（如按
+                # 分类代码报价的行），避免导出型号列空白。
+                code_or_model = _option_field(primary, "product_code") or _option_field(primary, "model")
+                values["型号"] = normalize_standard_code(code_or_model)
                 values["产品编码"] = normalize_standard_code(_option_field(primary, "product_code"))
                 spec_text = _option_field(primary, "spec")
                 if not spec_text and spec_alias_cache is not None and primary.history_quote is not None:
