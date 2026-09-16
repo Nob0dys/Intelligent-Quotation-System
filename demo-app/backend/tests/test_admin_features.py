@@ -170,6 +170,40 @@ def test_export_multi_option_quantity_and_totals():
         assert "报价2单价" in internal_headers
 
 
+def test_export_appends_without_overwriting_original_price():
+    """原表已有“单价”列时：确认结果追加到新的“确认单价”列，原值保持不变；
+    数量/总价/税后总价必须随导出生成（合并表头“参考数量”也要识别）。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "清单"
+    sheet.append(["序号", "产品名称", "参数", "型号", "单位", "参考数量", "单价"])
+    sheet.append([1, "电子天平", "100g，0.001g，带防风罩", "", "台", 2, 999])
+    stream = BytesIO()
+    workbook.save(stream)
+    with TestClient(app) as client:
+        login(client)
+        job_id = create_job(client, ordinary_customer_id(client), stream.getvalue())
+        export = client.post(f"/api/quote-jobs/{job_id}/auto-confirm-and-export/internal")
+        assert export.status_code == 200, export.text
+        exported = load_workbook(BytesIO(export.content))
+        sheet2 = exported["清单"]
+        header_values = [cell.value for cell in sheet2[1]]
+        original_col = header_values.index("单价") + 1
+        # 原有内容不被覆盖
+        assert sheet2.cell(2, original_col).value == 999
+        # 确认结果在新列
+        confirm_col = header_values.index("确认单价") + 1
+        confirmed = sheet2.cell(2, confirm_col).value
+        assert confirmed and confirmed != 999
+        # 数量 / 总价 / 税后总价已生成
+        quantity_col = header_values.index("参考数量") + 1
+        total_col = header_values.index("总价") + 1
+        tax_total_col = header_values.index("税后总价") + 1
+        assert sheet2.cell(2, quantity_col).value == 2
+        assert sheet2.cell(2, total_col).value == round(confirmed * 2, 2)
+        assert sheet2.cell(2, tax_total_col).value == round(confirmed * 1.1 * 2, 2)
+
+
 def test_job_rename_and_delete():
     with TestClient(app) as client:
         login(client)

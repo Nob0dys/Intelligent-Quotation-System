@@ -103,6 +103,21 @@ def test_exact_aliases_win_over_fuzzy_name_matching(tmp_path):
     assert lines[0]["model"] == "XY-100"
 
 
+def test_merged_header_quantity_on_sub_header_row(tmp_path):
+    """滨达乡小学式合并表头：主表头行“单位”跨列，子表头“参考数量”写在下一行。
+    数量列必须识别，否则导出缺数量/总价/税后总价。"""
+    path = save_workbook(tmp_path, [
+        ["器材类型", None, "分类代码", "器材名称", "规格、品名、教学性能要求", "单位", None, None],
+        [None, None, None, None, None, None, "参考数量", "单价"],
+        [None, "基础用品", "30201000601", "钢卷尺", "量程 0mm～2000mm", "盒", 10, 3],
+    ])
+    lines = parse_quote_workbook(path)
+
+    assert lines[0]["name"] == "钢卷尺"
+    assert lines[0]["quantity"] == 10
+    assert lines[0]["pricing_quantity"] == 10
+
+
 def test_plain_price_column_does_not_override_quantity_minimal(tmp_path):
     path = save_workbook(tmp_path, [
         ["序号", "产品名称", "参数", "数量", "单位", "含税单价", "金额"],

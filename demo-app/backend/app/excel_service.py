@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
 HEADER_ALIASES = {
     "name": ("采购品目", "货物名称", "产品名称", "品名", "器材名称", "设备名称", "仪器名称", "名称"),
     "product_code": ("产品编码", "编码", "编号", "货号"),
-    "quantity": ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数"),
+    "quantity": ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数", "参考数量"),
     "unit": ("单位", "计量单位"),
     "spec": ("参数", "技术参数", "主要技术参数", "主要性能要求", "技术性能要求", "性能要求", "规格", "规格参数", "规格说明", "技术要求"),
     "model": ("规格型号", "型号", "规格"),
@@ -207,6 +207,31 @@ def find_header(ws, extra_aliases: dict | None = None, start_row: int = 1) -> tu
                 ),
                 0,
             )
+        # 合并单元格表头：主表头行整列合并（如“单位”跨 单位/数量/单价 多列），
+        # 子表头（“参考数量”“单价”）写在下一行。仍缺的字段到下一行补认，仅接受
+        # 主表头行对应单元格为空的列，避免把数据行误判成表头。
+        if row_number < ws.max_row:
+            sub_values = [
+                normalize_header_key(ws.cell(row_number + 1, column))
+                for column in range(1, ws.max_column + 1)
+            ]
+            taken = {index for index in columns.values() if index}
+            for field, aliases in normalized_aliases.items():
+                if columns.get(field):
+                    continue
+                match = next(
+                    (
+                        index + 1
+                        for index, value in enumerate(sub_values)
+                        if value in aliases
+                        and index + 1 not in taken
+                        and not normalize_header_key(ws.cell(row_number, index + 1))
+                    ),
+                    0,
+                )
+                if match:
+                    columns[field] = match
+                    taken.add(match)
         return row_number, columns
     return None
 
@@ -696,12 +721,14 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
         extra_option_count = max(0, (job.requested_option_count or 1) - 1)
 
         # 原表各列表头已在行内时优先复用，避免导出重复的 数量/单位 等列。
+        # 复用列只做同值回填；已有内容的单元格绝不覆盖（见下方写入守卫）。
         existing: dict[str, int] = {}
         for column in range(1, ws.max_column + 1):
             label = ws.cell(header_row, column).value
             if label:
                 existing.setdefault(normalize_header_key(label), column)
         assign: dict[str, int] = {}
+        reused_columns: set[int] = set()
         next_col = ws.max_column + 1
 
         def ensure(field: str, header_label: str, key_hints: tuple[str, ...]) -> None:
@@ -709,6 +736,7 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
             for key in key_hints:
                 if key in existing:
                     assign[field] = existing[key]
+                    reused_columns.add(existing[key])
                     return
             col = next_col
             cell = ws.cell(header_row, col, header_label)
@@ -718,10 +746,12 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
             assign[field] = col
             next_col += 1
 
-        ensure("数量", "数量", ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数"))
-        ensure("确认单价", "确认单价", ("确认单价", "单价"))
+        # 确认单价/总价是本次匹配的新结果，必须追加新列：原表的“单价”“金额”
+        # 列是客户已有内容（可能带公式），写入会覆盖原值，只允许补充不允许改写。
+        ensure("数量", "数量", ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数", "参考数量"))
+        ensure("确认单价", "确认单价", ("确认单价",))
         ensure("税后单价", "税后单价", ("税后单价",))
-        ensure("总价", "总价", ("总价", "金额"))
+        ensure("总价", "总价", ("总价",))
         ensure("税后总价", "税后总价", ("税后总价",))
         ensure("品牌", "品牌", ("品牌", "商标"))
         ensure("制造商", "制造商", ("制造商", "制造商名称", "制造厂家", "厂家", "生产厂家"))
@@ -801,7 +831,12 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
                 values["风险提示"] = "；".join(line.warnings or [])
                 values["历史来源"] = _option_source(primary) if primary else ""
             for field, value in values.items():
-                cell = ws.cell(row_number, assign[field], value)
+                column = assign[field]
+                cell = ws.cell(row_number, column)
+                # 复用原表列时，已有内容的单元格保持原值，只在空白处补充。
+                if column in reused_columns and cell.value not in (None, ""):
+                    continue
+                cell.value = value
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
                 cell.fill = PatternFill(
                     "solid", fgColor="E8F5EE" if line.confirmed else "FFF4CC"
