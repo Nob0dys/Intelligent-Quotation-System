@@ -309,7 +309,7 @@ export function QuoteApp() {
             <NavButton active={activeView === "customers"} number="03" title="客户档案" detail="普通、特殊、VIP" onClick={() => setActiveView("customers")} />
             <NavButton active={activeView === "history"} number="04" title="历史报价" detail="价格、厂家、来源" onClick={() => setActiveView("history")} />
             <NavButton active={activeView === "governance"} number="05" title="数据治理" detail="冲突、权重、审计" onClick={() => setActiveView("governance")} />
-            {user.role === "admin" && <NavButton active={activeView === "databases"} number="06" title="数据库管理" detail="新建、切换、导入" onClick={() => setActiveView("databases")} />}
+            {user.role === "admin" && <NavButton active={activeView === "databases"} number="06" title="数据库管理" detail="新建、导入" onClick={() => setActiveView("databases")} />}
             {user.role === "admin" && <NavButton active={activeView === "accounts"} number="07" title="账号管理" detail="用户、角色、状态" onClick={() => setActiveView("accounts")} />}
           </nav>
           <div className="sidebar-stat">
@@ -335,6 +335,9 @@ export function QuoteApp() {
           {activeView === "new" && (
             <NewQuote
               customers={customers}
+              user={user}
+              onChanged={loadAppData}
+              notify={notify}
               onCreated={async (job) => {
                 await refreshJobs(job.id);
                 setActiveView("tasks");
@@ -490,7 +493,7 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`status-pill status-${status}`} title={STATUS_HINT[status]}>{STATUS_COPY[status] ?? status}</span>;
 }
 
-function NewQuote({ customers, onCreated }: { customers: Customer[]; onCreated: (job: Job) => void }) {
+function NewQuote({ customers, user, onCreated, onChanged, notify }: { customers: Customer[]; user: User; onCreated: (job: Job) => void; onChanged: () => Promise<void>; notify: (message: string) => void }) {
   const [customerId, setCustomerId] = useState<number | null>(null);
   const [customerGroup, setCustomerGroup] = useState<Customer["customer_type"]>("ordinary");
   const [customerSearch, setCustomerSearch] = useState("");
@@ -536,7 +539,14 @@ function NewQuote({ customers, onCreated }: { customers: Customer[]; onCreated: 
       <PageHeading eyebrow="NEW QUOTATION" title="新建报价任务" detail="先确定客户策略，再上传询价单。匹配工作在服务器后台完成。" />
       <form className="new-quote-layout" onSubmit={submit}>
         <div className="form-card">
-          <div className="step-label"><b>01</b><span>选择客户</span></div>
+          {user.role === "admin" && (
+            <>
+              <div className="step-label"><b>01</b><span>选择数据库</span></div>
+              <DatabaseSwitcher onChanged={onChanged} notify={notify} />
+              <div className="step-label"><b>02</b><span>选择客户</span></div>
+            </>
+          )}
+          {user.role !== "admin" && <div className="step-label"><b>01</b><span>选择客户</span></div>}
           <div className="customer-group-tabs">{CUSTOMER_GROUPS.map((item) => <button type="button" key={item.type} className={customerGroup === item.type ? "active" : ""} onClick={() => setCustomerGroup(item.type)}>{item.title}</button>)}</div>
           <div className="row-search customer-picker-search"><span>⌕</span><input value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="按客户名称过滤" /></div>
           <div className="customer-picker-list">
@@ -545,12 +555,12 @@ function NewQuote({ customers, onCreated }: { customers: Customer[]; onCreated: 
             {groupCustomers.length === 0 && <small className="picker-empty">该分组下没有匹配的客户</small>}
           </div>
           {selectedCustomer && <CustomerPolicy customer={selectedCustomer} />}
-          <div className="step-label"><b>02</b><span>多报价设置</span></div>
+          <div className="step-label"><b>03</b><span>多报价设置</span></div>
           <div className="option-picker"><div><strong>每个商品推荐几个制造商方案？</strong><span>候选不足时按实际可用数量展示</span></div><div>{[1, 2, 3, 4, 5].map((value) => <button type="button" className={optionCount === value ? "active" : ""} key={value} onClick={() => pickOptionCount(value)}>{value}</button>)}</div></div>
           <div className="option-picker"><div><strong>税后价格税率？（%）</strong><span>导出时按 确认单价×(1+税率) 计算 税后单价 / 税后总价</span></div><div><input className="tax-rate-input" type="number" min={0} max={100} step={0.1} value={taxPercent} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) { setTaxPercent(value); window.localStorage.setItem("quote-tax-rate", String(value)); } }} /></div></div>
         </div>
         <div className="form-card upload-section">
-          <div className="step-label"><b>03</b><span>上传询价单</span></div>
+          <div className="step-label"><b>04</b><span>上传询价单</span></div>
           <label className={`upload-card ${file ? "has-file" : ""}`}>
             <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
             <span className="upload-icon">↑</span>
@@ -1413,9 +1423,8 @@ function ChangePasswordModal({ onClose, notify }: { onClose: () => void; notify:
   );
 }
 
-function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>; notify: (message: string) => void }) {
+function DatabaseSwitcher({ onChanged, notify }: { onChanged: () => Promise<void>; notify: (message: string) => void }) {
   const [data, setData] = useState<DatabaseList | null>(null);
-  const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -1450,6 +1459,65 @@ function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>
     }
   }
 
+  const current = data?.databases.find((db) => db.name === data.current) ?? null;
+
+  if (data === null && error) {
+    return (
+      <div className="db-switcher">
+        <div className="form-error">{error}</div>
+        <button className="secondary-button" style={{ marginTop: 10 }} onClick={() => void load()}>重试</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="db-switcher">
+      <div className="db-switcher-chips">
+        {(data?.databases ?? []).map((db) => {
+          const active = db.name === data?.current;
+          return (
+            <button
+              key={db.name}
+              type="button"
+              className={`db-chip ${active ? "active" : ""}`}
+              disabled={busy || active}
+              onClick={() => void switchTo(db.name)}
+              title={db.exists ? `${db.history_count.toLocaleString("zh-CN")} 条历史 · ${db.job_count} 个任务 · ${db.size_mb} MB` : "尚未创建"}
+            >
+              <strong>{db.name}</strong>
+              <span>{active ? "● 当前" : db.exists ? `${db.history_count.toLocaleString("zh-CN")} 条历史` : "尚未创建"}</span>
+            </button>
+          );
+        })}
+      </div>
+      {error && <div className="form-error" style={{ marginTop: 8 }}>{error}</div>}
+      {current && (
+        <p className="db-switcher-note">
+          当前库「{current.name}」共 {current.history_count.toLocaleString("zh-CN")} 条历史报价、{current.job_count} 个任务（{current.size_mb} MB）。上传询价单前请确认已切换到正确的数据库。
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>; notify: (message: string) => void }) {
+  const [data, setData] = useState<DatabaseList | null>(null);
+  const [newName, setNewName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      setData(await api<DatabaseList>("/api/databases"));
+      setError("");
+    } catch {
+      setError("无法连接服务器，请确认后端已启动后点重试");
+    }
+  }, []);
+  // Fetching the server-owned database list is the synchronization purpose of this effect.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { void load(); }, [load]);
+
   async function createNew(event: FormEvent) {
     event.preventDefault();
     const name = newName.trim();
@@ -1482,7 +1550,7 @@ function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>
 
   return (
     <section>
-      <PageHeading eyebrow="DATABASE ADMINISTRATION" title="数据库管理" detail="新建空库、切换历史库。切换后请到「数据治理」导入价目本。" />
+      <PageHeading eyebrow="DATABASE ADMINISTRATION" title="数据库管理" detail="新建空库、查看已有库。切换数据库请到「新建报价」操作；新建后请到「数据治理」导入价目本。" />
       {error && <div className="form-error">{error}</div>}
       <div className="form-card import-card">
         <div>
@@ -1518,11 +1586,6 @@ function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>
               <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: 10 }}>
                 {db.exists ? `${db.size_mb} MB · ${db.job_count} 个任务` : "尚未创建"}
               </p>
-              {!active && (
-                <button className="secondary-button" style={{ marginTop: 10 }} disabled={busy} onClick={() => void switchTo(db.name)}>
-                  切换到此库
-                </button>
-              )}
             </article>
           );
         })}

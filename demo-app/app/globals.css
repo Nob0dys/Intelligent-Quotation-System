@@ -125,6 +125,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .step-label:not(:first-child) { margin-top: 24px; }
 .step-label b { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 7px; color: var(--teal-dark); background: var(--teal-soft); font-size: 9px; }
 .step-label span { font-size: 13px; font-weight: 750; }
+.db-switcher-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.db-chip { display: flex; min-width: 130px; flex-direction: column; align-items: flex-start; gap: 2px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: white; cursor: pointer; text-align: left; }
+.db-chip:hover:not(:disabled) { border-color: var(--teal); }
+.db-chip:disabled { cursor: default; }
+.db-chip.active { border: 2px solid var(--teal); padding: 8px 11px; }
+.db-chip strong { font-size: 12px; }
+.db-chip span { color: var(--muted); font-size: 10px; }
+.db-chip.active span { color: var(--teal); font-weight: 700; }
+.db-switcher-note { margin: 10px 0 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .field-label > span, .login-card label > span, .drawer-fields label > span, .inline-form label > span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 10px; font-weight: 700; }
 .field-label select, .inline-form input, .inline-form select { width: 100%; padding: 10px 11px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); background: white; }
 .customer-policy { margin-top: 13px; padding: 15px; border: 1px solid #cbded6; border-radius: 10px; background: #f2f8f5; }
