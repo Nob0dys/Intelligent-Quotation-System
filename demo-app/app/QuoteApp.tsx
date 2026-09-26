@@ -3,7 +3,7 @@
 import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 type Role = "admin" | "quote";
-type ActiveView = "tasks" | "new" | "customers" | "history" | "governance" | "accounts" | "databases";
+type ActiveView = "tasks" | "new" | "customers" | "history" | "assets" | "accounts";
 type RowFilter = "all" | "pending" | "suggested" | "review" | "unmatched" | "unit_conflict" | "parameter_conflict" | "price_anomaly" | "score_tie" | "low_confidence" | "confirmed";
 type LineSort = "score_asc" | "score_desc" | "source_row";
 
@@ -28,7 +28,6 @@ type Customer = {
   notes: string;
   created_at: string;
   requirements: Requirement[];
-  price_sheet_count: number;
 };
 type Job = {
   id: string;
@@ -38,6 +37,8 @@ type Job = {
   progress: number;
   requested_option_count: number;
   tax_rate: number;
+  database_key: string;
+  database_name: string;
   total_lines: number;
   matched_lines: number;
   review_lines: number;
@@ -112,8 +113,272 @@ type Governance = {
   matching_weights: Record<string, number>;
 };
 type HistoryResult = HistoryRecord & { source: string };
-type DatabaseInfo = { name: string; exists: boolean; size_mb: number; history_count: number; job_count: number };
-type DatabaseList = { current: string; databases: DatabaseInfo[] };
+type DatabaseEntry = {
+  key: string;
+  name: string;
+  note: string;
+  tags: string[];
+  status: "active" | "trashed";
+  exists: boolean;
+  size_mb: number;
+  history_count: number;
+  job_count: number;
+  is_system: boolean;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string;
+  use_count: number;
+};
+type DatabaseList = { system: string; databases: DatabaseEntry[]; trashed: DatabaseEntry[] };
+type DatabaseSearchResult = { system: string; databases: DatabaseEntry[] };
+type AuditEvent = {
+  id: number;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  detail: Record<string, unknown>;
+  created_at: string;
+  user: User;
+};
+
+// ---- 价目表格化编辑 --------------------------------------------------------
+
+type EditableField =
+  | "name" | "spec" | "model" | "brand" | "manufacturer"
+  | "unit" | "product_code" | "price" | "quantity" | "quote_date";
+
+type HistoryRow = {
+  id: string;
+  name: string;
+  spec: string;
+  model: string;
+  brand: string;
+  manufacturer: string;
+  unit: string;
+  product_code: string;
+  price: number;
+  quantity: number | null;
+  quote_date: string;
+  source_file: string;
+  source_sheet: string;
+  source_row: number;
+  source_priority: number;
+  data_quality: number;
+  revision: number;
+};
+
+type HistoryRowsPage = {
+  database_key: string;
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+  editable_fields: string[];
+  readonly_fields: string[];
+  max_bulk_rows: number;
+  rows: HistoryRow[];
+};
+
+type EditConflict = {
+  id?: string;
+  name?: string;
+  location?: string;
+  actual_revision?: number;
+  expected_revision?: number;
+};
+
+type BulkEditRowResult = {
+  op: "create" | "update" | "delete";
+  id: string | null;
+  status: "ok" | "conflict" | "rejected";
+  reason?: "revision_mismatch" | "duplicate_key" | "invalid" | "missing";
+  message?: string;
+  changed?: string[];
+  revision?: number;
+  conflict?: EditConflict;
+};
+
+type BulkEditResponse = {
+  ok: boolean;
+  database_key: string;
+  applied: { created: number; updated: number; deleted: number };
+  unchanged: number;
+  skipped_duplicates: number;
+  rejected: number;
+  results: BulkEditRowResult[];
+  backup: string;
+};
+
+// ---- 打开本地价目本：先解析比对，用户确认后再落库 --------------------------
+
+type OpenFileAction = "create" | "update" | "unchanged" | "ambiguous" | "duplicate" | "invalid";
+
+type OpenFileValues = Record<string, string | number | null>;
+
+// 库里被匹配到的那一条（候选或唯一目标）。values 是"文件覆盖到库里现值上"的
+// 结果，前端直接拿它当 bulk-edit 的 changes，不再自己合并一遍。
+type OpenFileTarget = {
+  id: string;
+  revision: number;
+  price: number | null;
+  location: string;
+  current?: OpenFileValues;
+  values?: OpenFileValues;
+  changed?: string[];
+};
+
+type OpenFileRow = {
+  seq: number;
+  source: string;
+  action: OpenFileAction;
+  reason: string;
+  target: OpenFileTarget | null;
+  targets: OpenFileTarget[];
+  warnings: string[];
+  match_fields: string[];
+  match_labels: string[];
+  current?: OpenFileValues;
+  values?: OpenFileValues;
+  changed?: string[];
+};
+
+type OpenFilePreview = {
+  database_key: string;
+  source: string;
+  total: number;
+  summary: Record<OpenFileAction, number>;
+  max_bulk_rows: number;
+  rows: OpenFileRow[];
+};
+
+// 预览分组：顺序即用户该关心的顺序，"将改动"放最前。
+const OPEN_FILE_GROUPS: Array<{ key: string; title: string; actions: OpenFileAction[] }> = [
+  { key: "change", title: "将改动", actions: ["update", "create", "ambiguous"] },
+  { key: "unchanged", title: "无需改动", actions: ["unchanged"] },
+  { key: "skipped", title: "不载入", actions: ["duplicate", "invalid"] },
+];
+
+const OPEN_FILE_ACTION_LABEL: Record<OpenFileAction, string> = {
+  create: "新增",
+  update: "修改",
+  unchanged: "无需改动",
+  ambiguous: "需指定",
+  duplicate: "重复",
+  invalid: "不载入",
+};
+
+// 变更集里只发可编辑字段。预览返回的 values 可能带只读字段（id 之类）吗？
+// 不会——它来自 history_rows.editable_payload，但为了不把服务端的字段集合
+// 当成前端的契约，这里仍按 EDIT_FIELDS 过滤一遍。
+function pickChanges(values: OpenFileValues | undefined): Record<string, string | number | null> {
+  const changes: Record<string, string | number | null> = {};
+  if (!values) return changes;
+  for (const field of EDIT_FIELDS) {
+    if (field.key in values) changes[field.key] = values[field.key];
+  }
+  return changes;
+}
+
+// 前后对比只展示真正变化的字段，避免 10 列全铺开。
+function changeSummary(current: OpenFileValues | undefined, values: OpenFileValues | undefined): string[] {
+  if (!values) return [];
+  const lines: string[] = [];
+  for (const field of EDIT_FIELDS) {
+    if (!(field.key in values)) continue;
+    const next = values[field.key] ?? "";
+    if (current === undefined) {
+      if (String(next).trim() === "") continue;
+      lines.push(`${field.label}：${next}`);
+      continue;
+    }
+    const before = current[field.key] ?? "";
+    if (String(before) === String(next)) continue;
+    lines.push(`${field.label}：${before} → ${next}`);
+  }
+  return lines;
+}
+
+// 预览里"将改动"的那些行里，用户有权逐行排除：一份价目本可能混着暂时不想动的新品，
+// 全有或全无的确认不算确认。这里算出"实际会写什么"，计数和提交都走同一份结果，
+// 免得按钮上的数字和真正提交的行数对不上。
+function planFromPreview(
+  preview: OpenFilePreview,
+  excluded: ReadonlySet<number>,
+  picks: Record<number, string>,
+) {
+  const created: Array<{ changes: Record<string, string | number | null> }> = [];
+  const updated: Array<{ id: string; revision: number; changes: Record<string, string | number | null> }> = [];
+  let unpicked = 0;
+  for (const row of preview.rows) {
+    if (row.action !== "create" && row.action !== "update" && row.action !== "ambiguous") continue;
+    if (excluded.has(row.seq)) continue;
+    if (row.action === "create") {
+      created.push({ changes: pickChanges(row.values) });
+    } else if (row.action === "update" && row.target) {
+      updated.push({ id: row.target.id, revision: row.target.revision, changes: pickChanges(row.values) });
+    } else if (row.action === "ambiguous") {
+      const chosen = row.targets.find((item) => item.id === picks[row.seq]);
+      if (!chosen) { unpicked += 1; continue; }
+      updated.push({ id: chosen.id, revision: chosen.revision, changes: pickChanges(chosen.values) });
+    }
+  }
+  return { created, updated, unpicked, writable: created.length + updated.length };
+}
+
+// 网格列定义。派生列（normalized_*、data_quality）与溯源列（来源、版本号）
+// 不在其中——服务端不接受它们作为可编辑字段。
+const EDIT_FIELDS: Array<{ key: EditableField; label: string; kind: "text" | "number"; width: number }> = [
+  { key: "name", label: "产品名称", kind: "text", width: 200 },
+  { key: "spec", label: "参数 / 规格", kind: "text", width: 210 },
+  { key: "model", label: "型号", kind: "text", width: 110 },
+  { key: "brand", label: "品牌", kind: "text", width: 100 },
+  { key: "manufacturer", label: "制造商", kind: "text", width: 130 },
+  { key: "unit", label: "单位", kind: "text", width: 70 },
+  { key: "product_code", label: "产品编码", kind: "text", width: 120 },
+  { key: "quantity", label: "数量", kind: "number", width: 80 },
+  // 价目本里的「含税单价」在导入时已按固定税率折成税前基准价，导出报价时再乘回税率。
+  // 这里必须写清楚，否则用户会按含税价改，报价就会整体偏低一个税点。
+  { key: "price", label: "单价（不含税）", kind: "number", width: 120 },
+  { key: "quote_date", label: "报价日期", kind: "text", width: 110 },
+];
+
+const ROWS_PAGE_SIZES = [50, 100, 200, 500];
+
+function rowValues(row: HistoryRow): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const field of EDIT_FIELDS) {
+    const value = row[field.key];
+    values[field.key] = value === null || value === undefined ? "" : String(value);
+  }
+  return values;
+}
+
+function rowSource(row: HistoryRow): string {
+  const parts = [row.source_file || "（无来源）"];
+  if (row.source_sheet) parts.push(row.source_sheet);
+  if (row.source_row) parts.push(`第${row.source_row}行`);
+  return parts.join(" · ");
+}
+
+// 变更集里只发这 10 个字段，派生列由服务端重算。
+function toChanges(values: Record<string, string>): Record<string, string | number | null> {
+  const changes: Record<string, string | number | null> = {};
+  for (const field of EDIT_FIELDS) {
+    const raw = values[field.key];
+    if (raw === undefined) continue;
+    if (field.kind === "number") {
+      changes[field.key] = raw.trim() === "" ? null : Number(raw);
+    } else {
+      changes[field.key] = raw;
+    }
+  }
+  return changes;
+}
+
+function csvCell(value: unknown): string {
+  const text = value === null || value === undefined ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
 
 const STATUS_COPY: Record<string, string> = {
   queued: "排队中",
@@ -308,9 +573,8 @@ export function QuoteApp() {
             <NavButton active={activeView === "new"} number="02" title="新建报价" detail="客户、文件、多方案" onClick={() => setActiveView("new")} />
             <NavButton active={activeView === "customers"} number="03" title="客户档案" detail="普通、特殊、VIP" onClick={() => setActiveView("customers")} />
             <NavButton active={activeView === "history"} number="04" title="历史报价" detail="价格、厂家、来源" onClick={() => setActiveView("history")} />
-            <NavButton active={activeView === "governance"} number="05" title="数据治理" detail="冲突、权重、审计" onClick={() => setActiveView("governance")} />
-            {user.role === "admin" && <NavButton active={activeView === "databases"} number="06" title="数据库管理" detail="新建、导入" onClick={() => setActiveView("databases")} />}
-            {user.role === "admin" && <NavButton active={activeView === "accounts"} number="07" title="账号管理" detail="用户、角色、状态" onClick={() => setActiveView("accounts")} />}
+            <NavButton active={activeView === "assets"} number="05" title="数据资产" detail="价目库、表格编辑、治理" onClick={() => setActiveView("assets")} />
+            {user.role === "admin" && <NavButton active={activeView === "accounts"} number="06" title="账号管理" detail="用户、角色、状态" onClick={() => setActiveView("accounts")} />}
           </nav>
           <div className="sidebar-stat">
             <span>历史报价库</span>
@@ -335,9 +599,6 @@ export function QuoteApp() {
           {activeView === "new" && (
             <NewQuote
               customers={customers}
-              user={user}
-              onChanged={loadAppData}
-              notify={notify}
               onCreated={async (job) => {
                 await refreshJobs(job.id);
                 setActiveView("tasks");
@@ -347,8 +608,7 @@ export function QuoteApp() {
           )}
           {activeView === "customers" && <CustomerDirectory customers={customers} user={user} onUpdated={loadAppData} notify={notify} />}
           {activeView === "history" && <HistorySearch user={user} notify={notify} />}
-          {activeView === "governance" && <GovernanceView data={governance} user={user} onChanged={loadAppData} notify={notify} />}
-          {activeView === "databases" && user.role === "admin" && <DatabaseManager onChanged={loadAppData} notify={notify} />}
+          {activeView === "assets" && <DataAssetsView data={governance} user={user} onChanged={loadAppData} notify={notify} />}
           {activeView === "accounts" && user.role === "admin" && <AccountAdmin notify={notify} />}
         </section>
       </section>
@@ -450,7 +710,7 @@ function TaskCenter({ jobs, onOpen, onCreate, onChanged, notify }: { jobs: Job[]
       </div>
       <div className="section-title"><div><h3>最近任务</h3><p>服务器会保留处理进度和人工选择</p></div></div>
       {jobs.length === 0 ? (
-        <div className="empty-state"><strong>还没有报价任务</strong><span>选择客户并上传一份 .xlsx 询价单开始。</span><button className="primary-button" onClick={onCreate}>创建第一个任务</button></div>
+        <div className="empty-state"><strong>还没有报价任务</strong><span>选择客户并上传一份 Excel 询价单开始。</span><button className="primary-button" onClick={onCreate}>创建第一个任务</button></div>
       ) : (
         <div className="job-list">
           {jobs.map((job) => (
@@ -466,7 +726,7 @@ function TaskCenter({ jobs, onOpen, onCreate, onChanged, notify }: { jobs: Job[]
                 ) : (
                   <div><strong>{job.display_name || job.file_name}</strong><StatusPill status={job.status} /></div>
                 )}
-                <span>{job.customer ? `${job.customer.name} · ${CUSTOMER_COPY[job.customer.customer_type]} · ` : "一次性报价 · "}{formatDate(job.created_at)}</span>
+                <span>{job.customer ? `${job.customer.name} · ${CUSTOMER_COPY[job.customer.customer_type]} · ` : "一次性报价 · "}{job.database_name ? `价目库 ${job.database_name} · ` : ""}{formatDate(job.created_at)}</span>
               </div>
               <div className="job-count"><b>{job.total_lines || "—"}</b><span>产品行</span></div>
               <div className="job-count warning"><b>{job.review_lines + job.unmatched_lines || 0}</b><span>需复核</span></div>
@@ -493,10 +753,12 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`status-pill status-${status}`} title={STATUS_HINT[status]}>{STATUS_COPY[status] ?? status}</span>;
 }
 
-function NewQuote({ customers, user, onCreated, onChanged, notify }: { customers: Customer[]; user: User; onCreated: (job: Job) => void; onChanged: () => Promise<void>; notify: (message: string) => void }) {
+function NewQuote({ customers, onCreated }: { customers: Customer[]; onCreated: (job: Job) => void }) {
   const [customerId, setCustomerId] = useState<number | null>(null);
   const [customerGroup, setCustomerGroup] = useState<Customer["customer_type"]>("ordinary");
   const [customerSearch, setCustomerSearch] = useState("");
+  const [databaseKey, setDatabaseKey] = useState("");
+  const [databaseName, setDatabaseName] = useState("");
   const [optionCount, setOptionCount] = useState(() => {
     const saved = Number(window.localStorage.getItem("quote-option-count"));
     return Number.isInteger(saved) && saved >= 1 && saved <= 5 ? saved : 3;
@@ -523,6 +785,7 @@ function NewQuote({ customers, user, onCreated, onChanged, notify }: { customers
     try {
       const data = new FormData();
       if (customerId != null) data.set("customer_id", String(customerId));
+      if (databaseKey) data.set("database_key", databaseKey);
       data.set("requested_option_count", String(optionCount));
       data.set("tax_rate", String(taxPercent / 100));
       data.set("file", file);
@@ -536,25 +799,22 @@ function NewQuote({ customers, user, onCreated, onChanged, notify }: { customers
   }
   return (
     <section>
-      <PageHeading eyebrow="NEW QUOTATION" title="新建报价任务" detail="先确定客户策略，再上传询价单。匹配工作在服务器后台完成。" />
+      <PageHeading eyebrow="NEW QUOTATION" title="新建报价任务" detail="先确定客户与价目库，再上传询价单。匹配工作在服务器后台完成。" />
       <form className="new-quote-layout" onSubmit={submit}>
         <div className="form-card">
-          {user.role === "admin" && (
-            <>
-              <div className="step-label"><b>01</b><span>选择数据库</span></div>
-              <DatabaseSwitcher onChanged={onChanged} notify={notify} />
-              <div className="step-label"><b>02</b><span>选择客户</span></div>
-            </>
-          )}
-          {user.role !== "admin" && <div className="step-label"><b>01</b><span>选择客户</span></div>}
+          <div className="step-label"><b>01</b><span>选择客户</span></div>
           <div className="customer-group-tabs">{CUSTOMER_GROUPS.map((item) => <button type="button" key={item.type} className={customerGroup === item.type ? "active" : ""} onClick={() => setCustomerGroup(item.type)}>{item.title}</button>)}</div>
           <div className="row-search customer-picker-search"><span>⌕</span><input value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="按客户名称过滤" /></div>
           <div className="customer-picker-list">
             <button type="button" className={customerId === null ? "active" : ""} onClick={() => setCustomerId(null)}><strong>不关联客户（一次性报价）</strong><span>不套用任何客户折扣与特殊要求</span></button>
-            {groupCustomers.map((customer) => <button type="button" key={customer.id} className={customerId === customer.id ? "active" : ""} onClick={() => setCustomerId(customer.id)}><strong>{customer.name}{customer.price_sheet_count > 0 && <em className="price-sheet-badge">专属价目</em>}</strong><span>{customer.notes || "暂无说明"}</span></button>)}
+            {groupCustomers.map((customer) => <button type="button" key={customer.id} className={customerId === customer.id ? "active" : ""} onClick={() => setCustomerId(customer.id)}><strong>{customer.name}</strong><span>{customer.notes || "暂无说明"}</span></button>)}
             {groupCustomers.length === 0 && <small className="picker-empty">该分组下没有匹配的客户</small>}
           </div>
           {selectedCustomer && <CustomerPolicy customer={selectedCustomer} />}
+          <DatabasePicker
+            value={databaseKey}
+            onChange={(key, name) => { setDatabaseKey(key); setDatabaseName(name); }}
+          />
           <div className="step-label"><b>03</b><span>多报价设置</span></div>
           <div className="option-picker"><div><strong>每个商品推荐几个制造商方案？</strong><span>候选不足时按实际可用数量展示</span></div><div>{[1, 2, 3, 4, 5].map((value) => <button type="button" className={optionCount === value ? "active" : ""} key={value} onClick={() => pickOptionCount(value)}>{value}</button>)}</div></div>
           <div className="option-picker"><div><strong>税后价格税率？（%）</strong><span>导出时按 确认单价×(1+税率) 计算 税后单价 / 税后总价</span></div><div><input className="tax-rate-input" type="number" min={0} max={100} step={0.1} value={taxPercent} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) { setTaxPercent(value); window.localStorage.setItem("quote-tax-rate", String(value)); } }} /></div></div>
@@ -562,13 +822,14 @@ function NewQuote({ customers, user, onCreated, onChanged, notify }: { customers
         <div className="form-card upload-section">
           <div className="step-label"><b>04</b><span>上传询价单</span></div>
           <label className={`upload-card ${file ? "has-file" : ""}`}>
-            <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+            <input type="file" accept=".xlsx,.xlsm,.xls,.csv" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
             <span className="upload-icon">↑</span>
             <strong>{file ? file.name : "选择待报价 Excel"}</strong>
-            <span>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 可随时重新选择` : "支持 .xlsx，单文件不超过 80MB"}</span>
+            <span>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 可随时重新选择` : "支持 .xlsx / .xlsm / .xls / .csv，单文件不超过 80MB"}</span>
             <em>{file ? "更换文件" : "浏览文件"}</em>
           </label>
           {error && <div className="form-error">{error}</div>}
+          {databaseKey && <p className="picker-selected muted">价目来源：{databaseName || databaseKey}</p>}
           <button className="primary-button submit-task" disabled={!file || busy}>{busy ? "正在上传…" : customerId != null ? `创建任务并推荐 ${optionCount} 个方案` : `创建一次性报价并推荐 ${optionCount} 个方案`}</button>
         </div>
       </form>
@@ -582,7 +843,6 @@ function CustomerPolicy({ customer }: { customer: Customer }) {
       <div><span>{CUSTOMER_COPY[customer.customer_type]}</span><strong>{customer.name}</strong></div>
       <p>{customer.notes || "暂无客户策略说明"}</p>
       {customer.discount_percent > 0 && <small>协议折扣 {customer.discount_percent}% · 需核对最低毛利</small>}
-      {customer.price_sheet_count > 0 && <small>已关联专属报价单（{customer.price_sheet_count} 条），匹配时优先使用该价目，价格不再叠加协议折扣</small>}
       {customer.requirements.length > 0 && <ul>{customer.requirements.map((item) => <li key={item.id}><b>{item.required ? "必选" : "偏好"}</b>{item.attribute_name} {item.operator} {item.value}{item.unit}</li>)}</ul>}
     </div>
   );
@@ -734,8 +994,8 @@ function JobWorkspace({ job, onBack, onRefresh, notify }: { job: Job; onBack: ()
   return (
     <section>
       <button className="back-button" onClick={onBack}>← 返回任务列表</button>
-      <PageHeading eyebrow="QUOTATION REVIEW" title={job.display_name || job.file_name} detail={`${job.customer?.name ?? "一次性报价"} · 每商品最多 ${job.requested_option_count} 个制造商方案· 税后税率 ${Math.round((job.tax_rate ?? 0.1) * 1000) / 10}%`} action={<StatusPill status={job.status} />} />
-      <div className="tax-notice"><label>税后价格税率</label><input type="number" min={0} max={100} step={0.1} value={taxDraft} onChange={(event) => setTaxDraft(event.target.value)} onBlur={() => void saveTax()} onKeyDown={(event) => { if (event.key === "Enter") void saveTax(); }} /><span>% · 导出时按 确认单价×(1+税率) 计算 税后单价 / 税后总价（回车或失焦保存）</span></div>
+      <PageHeading eyebrow="QUOTATION REVIEW" title={job.display_name || job.file_name} detail={`${job.customer?.name ?? "一次性报价"} · 价目库 ${job.database_name || "系统默认库"} · 每商品最多 ${job.requested_option_count} 个制造商方案· 税后税率 ${Math.round((job.tax_rate ?? 0.1) * 1000) / 10}%`} action={<StatusPill status={job.status} />} />
+      <div className="tax-notice"><label htmlFor="job-tax-rate">税后价格税率</label><input id="job-tax-rate" type="number" min={0} max={100} step={0.1} value={taxDraft} onChange={(event) => setTaxDraft(event.target.value)} onBlur={() => void saveTax()} onKeyDown={(event) => { if (event.key === "Enter") void saveTax(); }} /><span>% · 导出时按 确认单价×(1+税率) 计算 税后单价 / 税后总价（回车或失焦保存）</span></div>
       <div className="confirm-progress">
         <span>已确认 {job.confirmed_lines} / {job.total_lines} 行</span>
         <i><b style={{ width: `${job.total_lines ? Math.min(100, (job.confirmed_lines / job.total_lines) * 100) : 0}%` }} /></i>
@@ -814,19 +1074,13 @@ function CandidateDrawer({ lineId, maxOptions, onClose, onChanged }: { lineId: n
   const [manualPrice, setManualPrice] = useState("");
   const [manualError, setManualError] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
-  const [loadError, setLoadError] = useState("");
 
   const load = useCallback(async () => {
-    try {
-      const data = await api<QuoteLine>(`/api/quote-lines/${lineId}`);
-      setLine(data);
-      const options = data.options ?? [];
-      setSelected(options.filter((item) => item.selected).map((item) => item.id));
-      setPrices(Object.fromEntries(options.map((item) => [String(item.id), item.final_price])));
-      setLoadError("");
-    } catch (reason) {
-      setLoadError(reason instanceof Error ? reason.message : "候选方案加载失败");
-    }
+    const data = await api<QuoteLine>(`/api/quote-lines/${lineId}`);
+    setLine(data);
+    const options = data.options ?? [];
+    setSelected(options.filter((item) => item.selected).map((item) => item.id));
+    setPrices(Object.fromEntries(options.map((item) => [String(item.id), item.final_price])));
   }, [lineId]);
   // Fetching the server-owned candidate state is the synchronization purpose of this effect.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -957,7 +1211,6 @@ function CandidateDrawer({ lineId, maxOptions, onClose, onChanged }: { lineId: n
       <button className="drawer-dismiss" aria-label="关闭候选对比" onClick={onClose} />
       <aside className="candidate-drawer" role="dialog" aria-modal="true" aria-label="报价候选对比">
         <header><div><p className="eyebrow">CANDIDATE COMPARISON</p><h2>{line?.name ?? "正在加载…"}</h2><span>最多选择 {maxOptions} 个不同制造商方案</span></div><button onClick={onClose} aria-label="关闭">×</button></header>
-        {loadError && <div className="drawer-alert danger"><strong>加载失败</strong><span>{loadError}</span><button className="secondary-button" onClick={() => void load()}>重试</button></div>}
         {line && <div className="target-brief"><div><span>待报价参数</span><p>{line.spec || "无参数描述"}</p></div><div><span>目标型号 / 单位</span><strong>{line.model || "—"} / {line.unit || "无单位"}</strong></div><div><span>候选历史价区间{medianPrice != null ? ` · 中位 ¥${money(medianPrice)}` : ""}</span><strong>{priceRange}</strong><small className="price-chips">{sourceGroups.map((group) => <em key={group.name} title={`${group.name}：${group.count} 条候选`}>{group.name}×{group.count} ¥{money(group.min)}-{money(group.max)}</em>)}</small></div></div>}
         {line && line.warnings.length > 0 && <div className={`drawer-alert ${blockingWarnings(line.warnings).length ? "danger" : "warning"}`}><strong>{blockingWarnings(line.warnings).length ? "存在阻断风险" : "请人工核对"}</strong><span>{line.warnings.join("；").replaceAll("BLOCK: ", "")}</span></div>}
         <div className="candidate-list">
@@ -1103,7 +1356,6 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
   const [discount, setDiscount] = useState(initial?.discount_percent ?? 0);
   const [minimumMargin, setMinimumMargin] = useState(initial?.minimum_margin_percent ?? 0);
   const [preferredManufacturers, setPreferredManufacturers] = useState(initial?.preferred_manufacturers.join(", ") ?? "");
-  const [priceSheetFile, setPriceSheetFile] = useState<File | null>(null);
   const [error, setError] = useState("");
 
   function currentRequirement(): Omit<Requirement, "id"> | null {
@@ -1122,17 +1374,6 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
     setValue("");
     setUnit("");
     setError("");
-  }
-
-  async function removePriceSheet() {
-    if (!initial) return;
-    if (!window.confirm("确定删除该客户的专属报价单？")) return;
-    try {
-      await api<{ ok: boolean; deleted: number }>(`/api/customers/${initial.id}/price-sheet`, { method: "DELETE" });
-      await onSaved("专属报价单已删除。");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "删除失败");
-    }
   }
 
   async function submit(event: FormEvent) {
@@ -1155,37 +1396,18 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
           ? preferredManufacturers.split(/[,，]/).map((item) => item.trim()).filter(Boolean)
           : [],
       };
-      let customerId: number;
       if (editing) {
         await api<Customer>(`/api/customers/${initial.id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        customerId = initial.id;
       } else {
-        const created = await api<Customer>("/api/customers", {
+        await api<Customer>("/api/customers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        customerId = created.id;
-      }
-      if (priceSheetFile) {
-        try {
-          const formData = new FormData();
-          formData.set("file", priceSheetFile);
-          const result = await api<{ inserted: number; skipped_duplicates: number; skipped_invalid: number }>(`/api/customers/${customerId}/price-sheet`, { method: "POST", body: formData });
-          await onSaved(editing
-            ? `客户档案已更新，专属报价单已整表替换（导入 ${result.inserted} 条 / 重复跳过 ${result.skipped_duplicates} 条 / 无效 ${result.skipped_invalid} 条）。`
-            : `客户档案已创建，专属报价单已上传（导入 ${result.inserted} 条 / 重复跳过 ${result.skipped_duplicates} 条 / 无效 ${result.skipped_invalid} 条）。`);
-        } catch (reason) {
-          const message = reason instanceof Error ? reason.message : "上传失败";
-          await onSaved(editing
-            ? `客户档案已更新，但专属报价单上传失败，可重新上传：${message}`
-            : `客户档案已创建，但专属报价单上传失败，可在编辑中重新上传：${message}`);
-        }
-        return;
       }
       await onSaved(editing ? "客户档案已更新。" : "客户档案已创建。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); }
@@ -1218,21 +1440,6 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
         <label className="wide-field"><span>偏好制造商</span><input value={preferredManufacturers} onChange={(event) => setPreferredManufacturers(event.target.value)} placeholder="多个制造商用逗号分隔" /></label>
       </>}
 
-      <div className="price-sheet-block">
-        <strong>专属报价单（可选）</strong>
-        {editing && initial.price_sheet_count > 0 && (
-          <span className="price-sheet-current">
-            当前专属报价单：{initial.price_sheet_count} 条
-            <button type="button" className="card-action-button danger" onClick={() => void removePriceSheet()}>删除</button>
-          </span>
-        )}
-        <label className="import-file">
-          <input type="file" accept=".xlsx,.xls,.xlsm" onChange={(event) => setPriceSheetFile(event.target.files?.[0] ?? null)} />
-          <span>{priceSheetFile ? priceSheetFile.name : editing && initial.price_sheet_count > 0 ? `重新上传（整表替换现有 ${initial.price_sheet_count} 条）` : "选择专属报价单 Excel"}</span>
-        </label>
-        <small>上传后，该客户的报价任务将优先使用此价目（价格不叠加协议折扣）</small>
-      </div>
-
       <button className="primary-button">{editing ? "保存修改" : "保存客户"}</button>
       {error && <div className="form-error">{error}</div>}
     </form>
@@ -1243,21 +1450,12 @@ function HistorySearch({ user, notify }: { user: User; notify: (message: string)
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<HistoryResult[]>([]);
   const [loading, setLoading] = useState(false);
-  const [searchError, setSearchError] = useState("");
   const [showEntry, setShowEntry] = useState(false);
 
   async function runSearch(keyword: string) {
     if (!keyword.trim()) return;
     setLoading(true);
-    setSearchError("");
-    try {
-      setResults(await api<HistoryResult[]>(`/api/history/search?q=${encodeURIComponent(keyword.trim())}`));
-    } catch (reason) {
-      setResults([]);
-      setSearchError(reason instanceof Error ? reason.message : "查询失败");
-    } finally {
-      setLoading(false);
-    }
+    try { setResults(await api<HistoryResult[]>(`/api/history/search?q=${encodeURIComponent(keyword.trim())}`)); } finally { setLoading(false); }
   }
 
   async function submit(event: FormEvent) {
@@ -1268,8 +1466,7 @@ function HistorySearch({ user, notify }: { user: User; notify: (message: string)
     <section>
       <PageHeading eyebrow="HISTORICAL PRICES" title="历史报价查询" detail="从服务器数据库查询产品、参数、型号、品牌和制造商。" action={user.role === "admin" ? <button className="primary-button" onClick={() => setShowEntry(true)}>＋ 手工录入</button> : undefined} />
       <form className="large-search" onSubmit={submit}><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入产品名称、参数、型号、品牌或制造商" /><button className="primary-button">{loading ? "查询中…" : "查询"}</button></form>
-      {searchError && <div className="form-error">{searchError}</div>}
-      <div className="history-results">{results.map((item) => <article key={item.id}><div><h3>{item.name}</h3><strong>¥ {money(item.price)}</strong></div><span>{item.model || "无型号"} · {item.brand || "无品牌"} · {item.manufacturer || "无制造商"} · {item.unit || "无单位"}</span><p>{item.spec || "无参数描述"}</p><footer>{item.quote_date || "日期未记录"}<b>{item.source}</b></footer></article>)}{query && !loading && !searchError && !results.length && <div className="empty-state compact"><strong>没有找到相关历史报价</strong><span>可缩短关键词或改用产品名称。</span></div>}</div>
+      <div className="history-results">{results.map((item) => <article key={item.id}><div><h3>{item.name}</h3><strong>¥ {money(item.price)}</strong></div><span>{item.model || "无型号"} · {item.brand || "无品牌"} · {item.manufacturer || "无制造商"} · {item.unit || "无单位"}</span><p>{item.spec || "无参数描述"}</p><footer>{item.quote_date || "日期未记录"}<b>{item.source}</b></footer></article>)}{query && !loading && !results.length && <div className="empty-state compact"><strong>没有找到相关历史报价</strong><span>可缩短关键词或改用产品名称。</span></div>}</div>
       {showEntry && <HistoryEntryModal onClose={() => setShowEntry(false)} onSaved={async () => { setShowEntry(false); notify("历史报价已录入。"); await runSearch(query); }} />}
     </section>
   );
@@ -1337,38 +1534,157 @@ function HistoryEntryModal({ onClose, onSaved }: { onClose: () => void; onSaved:
   );
 }
 
-function GovernanceView({ data, user, onChanged, notify }: { data: Governance | null; user: User; onChanged: () => Promise<void>; notify: (message: string) => void }) {
-  const [dedupBusy, setDedupBusy] = useState(false);
+type AssetTab = "databases" | "table" | "governance" | "audit";
+
+// 「数据库」与「价目导入」已合并为一个 Tab：库的增删改与往库里灌价目本本来就是
+// 同一件事的两半，拆成两个 Tab 只会让人来回切。切换/激活库的入口已彻底移除。
+const ASSET_TABS: Array<{ key: AssetTab; title: string; detail: string; adminOnly?: boolean }> = [
+  { key: "databases", title: "价目库", detail: "新建、重命名、删除、导入价目本" },
+  { key: "table", title: "表格编辑", detail: "像表格一样增删改价目并保存回库" },
+  { key: "governance", title: "质量治理", detail: "冲突、权重、去重" },
+  { key: "audit", title: "审计事件", detail: "操作留痕", adminOnly: true },
+];
+
+function sortByRecent(entries: DatabaseEntry[]): DatabaseEntry[] {
+  return [...entries].sort((left, right) => {
+    const leftTime = left.last_used_at ? Date.parse(left.last_used_at) : 0;
+    const rightTime = right.last_used_at ? Date.parse(right.last_used_at) : 0;
+    if (leftTime !== rightTime) return rightTime - leftTime;
+    if (left.use_count !== right.use_count) return right.use_count - left.use_count;
+    return left.name.localeCompare(right.name, "zh-CN");
+  });
+}
+
+function formatRelative(value: string): string {
+  if (!value) return "尚未使用";
+  const diff = Date.now() - Date.parse(value);
+  if (!Number.isFinite(diff) || diff < 60000) return "刚刚";
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+function DataAssetsView({ data, user, onChanged, notify }: { data: Governance | null; user: User; onChanged: () => Promise<void>; notify: (message: string) => void }) {
+  const isAdmin = user.role === "admin";
+  const [tab, setTab] = useState<AssetTab>("databases");
+  const [databases, setDatabases] = useState<DatabaseEntry[]>([]);
+  const [trashed, setTrashed] = useState<DatabaseEntry[]>([]);
+  // 系统默认库的键。它是个常量（改配置才能换），不是"当前选中的库"——
+  // 界面上只把它当作各处未显式选库时的兜底默认值。
+  const [systemKey, setSystemKey] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const loadDatabases = useCallback(async () => {
+    const payload = await api<DatabaseList>("/api/databases");
+    setDatabases(payload.databases);
+    setTrashed(payload.trashed);
+    setSystemKey(payload.system);
+    setLoading(false);
+    return payload;
+  }, []);
+
+  // 库列表由服务端持有，拉取列表本身就是这个 effect 的同步目的。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { void loadDatabases(); }, [loadDatabases]);
+
+  async function reloadAll() {
+    await loadDatabases();
+    await onChanged();
+  }
+
+  const visibleTabs = ASSET_TABS.filter((item) => !item.adminOnly || isAdmin);
+
+  return (
+    <section>
+      <PageHeading
+        eyebrow="DATA ASSETS"
+        title="数据资产中心"
+        detail="统一管理价目库、导入价目本、查看质量治理指标与审计留痕。"
+      />
+      <div className="exception-tabs asset-tabs" aria-label="数据资产分区">
+        {visibleTabs.map((item) => (
+          <button key={item.key} className={tab === item.key ? "active" : ""} onClick={() => setTab(item.key)}>
+            {item.title}
+          </button>
+        ))}
+      </div>
+      {tab === "databases" && (
+        <DatabasePanel
+          databases={databases}
+          trashed={trashed}
+          loading={loading}
+          defaultKey={systemKey}
+          isAdmin={isAdmin}
+          onReload={reloadAll}
+          notify={notify}
+        />
+      )}
+      {tab === "table" && (
+        <TableEditPanel databases={databases} defaultKey={systemKey} isAdmin={isAdmin} onReload={reloadAll} notify={notify} />
+      )}
+      {tab === "governance" && (
+        <GovernancePanel databases={databases} defaultKey={systemKey} fallback={data} isAdmin={isAdmin} onReload={reloadAll} notify={notify} />
+      )}
+      {tab === "audit" && isAdmin && <AuditPanel />}
+    </section>
+  );
+}
+
+function DatabasePanel({ databases, trashed, loading, defaultKey, isAdmin, onReload, notify }: {
+  databases: DatabaseEntry[];
+  trashed: DatabaseEntry[];
+  loading: boolean;
+  defaultKey: string;
+  isAdmin: boolean;
+  onReload: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<DatabaseEntry | null>(null);
+  const [renamingKey, setRenamingKey] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
+  // 导入价目本（原「价目导入」Tab 的职责，已并入本 Tab）。
+  const [importKey, setImportKey] = useState("");
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importBusy, setImportBusy] = useState(false);
   const [importResult, setImportResult] = useState("");
+  const renameRef = useRef<HTMLInputElement>(null);
 
-  async function dedup() {
-    setDedupBusy(true);
-    try {
-      const result = await api<{ removed: number }>("/api/governance/dedup-history", { method: "POST" });
-      notify(`本次合并 ${result.removed} 条重复记录。`);
-      await onChanged();
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "去重失败");
-    } finally {
-      setDedupBusy(false);
-    }
-  }
+  // 进入重命名态后把焦点移到输入框（不用 autoFocus，避免可访问性告警）。
+  useEffect(() => { if (renamingKey) renameRef.current?.focus(); }, [renamingKey]);
 
-  async function importHistory() {
-    if (!importFile) return;
+  const keyword = search.trim().toLowerCase();
+  const visible = sortByRecent(
+    databases.filter((db) => !keyword
+      || db.name.toLowerCase().includes(keyword)
+      || db.key.toLowerCase().includes(keyword)
+      || db.tags.some((tag) => tag.toLowerCase().includes(keyword))),
+  );
+  const importOptions = sortByRecent(databases);
+  // 未选时落到系统默认库，避免在 effect 里同步改 state。
+  const importTarget = importKey || defaultKey || importOptions[0]?.key || "";
+
+  async function submitImport() {
+    if (!importFile || !importTarget) return;
     setImportBusy(true);
     setImportResult("");
     try {
       const formData = new FormData();
       formData.set("file", importFile);
-      const result = await api<{ inserted: number; skipped_duplicates: number; skipped_invalid: number }>("/api/governance/import-history", { method: "POST", body: formData });
-      const summary = `新增 ${result.inserted} 条 / 重复跳过 ${result.skipped_duplicates} 条 / 无效 ${result.skipped_invalid} 条`;
+      const payload = await api<{ inserted: number; skipped_duplicates: number; skipped_invalid: number; database: string }>(
+        `/api/databases/${encodeURIComponent(importTarget)}/import`,
+        { method: "POST", body: formData },
+      );
+      const summary = `新增 ${payload.inserted} 条 / 重复跳过 ${payload.skipped_duplicates} 条 / 无效 ${payload.skipped_invalid} 条`;
       setImportResult(summary);
-      notify(`历史报价导入完成：${summary}。`);
+      notify(`价目本已导入「${payload.database}」：${summary}。`);
       setImportFile(null);
-      await onChanged();
+      await onReload();
     } catch (reason) {
       setImportResult(reason instanceof Error ? reason.message : "导入失败");
     } finally {
@@ -1376,8 +1692,1325 @@ function GovernanceView({ data, user, onChanged, notify }: { data: Governance | 
     }
   }
 
-  if (!data) return <section><div className="empty-state">正在加载数据治理摘要…</div></section>;
-  return <section><PageHeading eyebrow="DATA GOVERNANCE" title="数据治理中心" detail="在报价之前先暴露重复、单位和价格口径问题。" action={user.role === "admin" ? <button className="primary-button" disabled={dedupBusy} onClick={() => void dedup()}>{dedupBusy ? "正在去重…" : "一键去重历史报价"}</button> : undefined} /><div className="governance-grid"><Metric label="历史记录" value={data.record_count} tone="teal" /><Metric label="同名重复组" value={data.duplicate_name_groups} tone="slate" /><Metric label="同名多单位组" value={data.unit_conflict_groups} tone="red" /><Metric label="同名多价格组" value={data.price_conflict_groups} tone="amber" /><Metric label="缺制造商记录" value={data.missing_manufacturer_count} tone="blue" /><Metric label="审计事件" value={data.audit_event_count} tone="slate" /></div>{user.role === "admin" && <div className="form-card import-card"><div><h3>导入历史报价</h3><p>支持 .xlsx / .xlsm / .xls 文件，重复与无效行会自动跳过并计数。</p></div><label className="import-file"><input type="file" accept=".xlsx,.xlsm,.xls" onChange={(event) => { setImportFile(event.target.files?.[0] ?? null); setImportResult(""); }} /><span>{importFile ? importFile.name : "选择历史报价 Excel"}</span></label><button className="primary-button" disabled={!importFile || importBusy} onClick={() => void importHistory()}>{importBusy ? "正在导入…" : "上传导入"}</button>{importResult && <span className="import-result">{importResult}</span>}</div>}<div className="governance-panels"><article><p className="eyebrow">MATCHING POLICY</p><h3>当前匹配权重</h3><div className="weight-list">{Object.entries(data.matching_weights).map(([label, value]) => <div key={label}><span>{label}</span><i><b style={{ width: `${value * 2}%` }} /></i><strong>{value}%</strong></div>)}</div><p>编码精确命中优先；低于55分不作为可靠匹配；阻断风险不能被批量确认。</p></article><article><p className="eyebrow">UNIT POLICY</p><h3>单位校验边界</h3><ul><li><b>绿色</b>单位完全一致</li><li><b>橙色</b>克/千克、毫升/升等可换算</li><li><b>红色</b>瓶/盒/套与克等不可直接换算</li></ul><p>包装单位只有在记录净含量后才能折算，避免错误单价进入客户报价。</p></article></div></section>;
+  async function submitRename(entry: DatabaseEntry) {
+    const value = renameDraft.trim();
+    if (!value || value === entry.name) {
+      setRenamingKey(null);
+      return;
+    }
+    setBusy(true);
+    try {
+      await api(`/api/databases/${encodeURIComponent(entry.key)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: value }),
+      });
+      notify("数据库已重命名。");
+      setRenamingKey(null);
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "重命名失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(entry: DatabaseEntry) {
+    if (!window.confirm(`确定删除数据库「${entry.name}」吗？\n该库有 ${entry.history_count.toLocaleString("zh-CN")} 条价目、${entry.job_count} 个报价任务。\n删除前会自动备份并移入回收站，可随时恢复。`)) return;
+    setBusy(true);
+    try {
+      const result = await api<{ bound_jobs: number }>(`/api/databases/${encodeURIComponent(entry.key)}`, { method: "DELETE" });
+      notify(result.bound_jobs
+        ? `已移入回收站；有 ${result.bound_jobs} 个报价任务仍引用该库，历史记录保留。`
+        : "已移入回收站，可在下方恢复。");
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "删除失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore(entry: DatabaseEntry) {
+    setBusy(true);
+    try {
+      await api(`/api/databases/${encodeURIComponent(entry.key)}/restore`, { method: "POST" });
+      notify(`已恢复「${entry.name}」。`);
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "恢复失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function purge(entry: DatabaseEntry) {
+    const typed = window.prompt(`彻底删除不可恢复。请输入库名「${entry.name}」确认：`);
+    if (typed === null) return;
+    setBusy(true);
+    try {
+      await api(`/api/databases/${encodeURIComponent(entry.key)}/purge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm_name: typed }),
+      });
+      notify("数据库已彻底删除。");
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "彻底删除失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      {isAdmin && (
+        <div className="asset-toolbar">
+          <div className="row-search customer-search">
+            <span>⌕</span>
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="按库名、文件键或标签过滤" />
+          </div>
+          <button className="primary-button" onClick={() => { setEditing(null); setShowForm((value) => !value); }}>
+            {showForm && !editing ? "取消" : "＋ 新建价目库"}
+          </button>
+        </div>
+      )}
+      {!isAdmin && (
+        <div className="row-search customer-search">
+          <span>⌕</span>
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="按库名或标签过滤" />
+        </div>
+      )}
+      {(showForm || editing) && (
+        <DatabaseForm
+          key={editing ? `edit-${editing.key}` : "new"}
+          initial={editing}
+          onCancel={() => { setShowForm(false); setEditing(null); }}
+          onReload={onReload}
+          onSaved={async (message) => { setShowForm(false); setEditing(null); notify(message); await onReload(); }}
+        />
+      )}
+
+      {isAdmin && importOptions.length > 0 && (
+        <div className="form-card import-card">
+          <div>
+            <h3>导入价目本到已有库</h3>
+            <p>给已经存在的库补传价目本。新建库时可以直接在「新建价目库」卡片里选文件，不必先建库再回来传。重复与无效行会自动跳过并计数，不影响库中已有记录。</p>
+          </div>
+          <label style={{ display: "block", marginBottom: 10 }}>
+            <span className="field-label">导入到</span>
+            <select value={importTarget} onChange={(event) => setImportKey(event.target.value)} style={{ width: "100%" }}>
+              {importOptions.map((db) => (
+                <option key={db.key} value={db.key}>
+                  {db.name}（{db.history_count.toLocaleString("zh-CN")} 条{db.is_system ? " · 系统默认" : ""}）
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="import-file">
+            <input type="file" accept=".xlsx,.xlsm,.xls,.csv" onChange={(event) => { setImportFile(event.target.files?.[0] ?? null); setImportResult(""); }} />
+            <span>{importFile ? importFile.name : "选择价目本 Excel"}</span>
+          </label>
+          <button className="primary-button" disabled={!importFile || !importTarget || importBusy} onClick={() => void submitImport()}>
+            {importBusy ? "正在导入…" : "上传导入"}
+          </button>
+          {importResult && <span className="import-result">{importResult}</span>}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="empty-state">正在加载数据库列表…</div>
+      ) : visible.length === 0 ? (
+        <div className="empty-state compact">
+          <strong>{keyword ? "没有匹配的数据库" : "还没有数据库"}</strong>
+          <span>{isAdmin ? "点击右上角「新建价目库」添加。" : "请联系管理员创建价目库。"}</span>
+        </div>
+      ) : (
+        <div className="governance-grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" }}>
+          {visible.map((db) => (
+            <article key={db.key} className="db-card" style={{ padding: 16, border: db.is_system ? "2px solid var(--teal)" : "1px solid var(--line)", borderRadius: 12, background: "white" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <div style={{ minWidth: 0 }}>
+                  {renamingKey === db.key ? (
+                    <input
+                      ref={renameRef}
+                      value={renameDraft}
+                      onChange={(event) => setRenameDraft(event.target.value)}
+                      onKeyDown={(event) => { if (event.key === "Enter") void submitRename(db); if (event.key === "Escape") setRenamingKey(null); }}
+                      style={{ width: "100%" }}
+                    />
+                  ) : (
+                    <h3 style={{ margin: 0, wordBreak: "break-word" }}>
+                      {db.name}
+                      {db.is_system && <span style={{ color: "var(--teal)", fontSize: 10, marginLeft: 8 }}>● 系统默认</span>}
+                    </h3>
+                  )}
+                  <small style={{ color: "var(--muted)", fontSize: 10 }}>{db.key}.db</small>
+                </div>
+                <strong style={{ color: "#994a10", whiteSpace: "nowrap" }}>{db.history_count.toLocaleString("zh-CN")} 条</strong>
+              </div>
+              <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: 10 }}>
+                {db.exists ? `${db.size_mb} MB · ${db.job_count} 个任务` : "库文件缺失"}
+                {` · ${formatRelative(db.last_used_at)}`}
+                {db.use_count ? ` · 累计使用 ${db.use_count} 次` : ""}
+              </p>
+              {db.note && <p style={{ margin: "6px 0 0", fontSize: 11 }}>{db.note}</p>}
+              {db.tags.length > 0 && (
+                <div className="asset-tags">{db.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
+              )}
+              {renamingKey === db.key ? (
+                <div className="asset-card-actions">
+                  <button className="card-action-button" disabled={busy} onClick={() => void submitRename(db)}>保存</button>
+                  <button className="card-action-button" onClick={() => setRenamingKey(null)}>取消</button>
+                </div>
+              ) : (
+                <div className="asset-card-actions">
+                  {isAdmin && (
+                    <>
+                      <button className="card-action-button" onClick={() => { setRenamingKey(db.key); setRenameDraft(db.name); }}>重命名</button>
+                      <button className="card-action-button" onClick={() => { setShowForm(false); setEditing(db); }}>编辑</button>
+                      <button className="card-action-button danger" disabled={busy || db.is_system} title={db.is_system ? "系统默认库不能删除" : undefined} onClick={() => void remove(db)}>删除</button>
+                    </>
+                  )}
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+
+      {isAdmin && trashed.length > 0 && (
+        <div className="trash-block">
+          <button className="text-button" onClick={() => setShowTrash((value) => !value)}>
+            {showTrash ? "收起回收站" : `回收站（${trashed.length}）`}
+          </button>
+          {showTrash && (
+            <div className="governance-grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", marginTop: 10 }}>
+              {trashed.map((db) => (
+                <article key={db.key} className="db-card" style={{ padding: 14, border: "1px dashed var(--line)", borderRadius: 12, background: "#fafafa" }}>
+                  <h3 style={{ margin: 0 }}>{db.name}</h3>
+                  <small style={{ color: "var(--muted)", fontSize: 10 }}>{db.key}.db · {db.history_count.toLocaleString("zh-CN")} 条价目</small>
+                  <div className="asset-card-actions">
+                    <button className="card-action-button" disabled={busy} onClick={() => void restore(db)}>恢复</button>
+                    <button className="card-action-button danger" disabled={busy} onClick={() => void purge(db)}>彻底删除</button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function DatabaseForm({ initial, onSaved, onCancel, onReload }: {
+  initial: DatabaseEntry | null;
+  onSaved: (message: string) => void | Promise<void>;
+  onCancel: () => void;
+  onReload: () => Promise<void>;
+}) {
+  const editing = initial !== null;
+  const [name, setName] = useState(initial?.name ?? "");
+  const [note, setNote] = useState(initial?.note ?? "");
+  const [tags, setTags] = useState((initial?.tags ?? []).join(", "));
+  // 价目本文件。留空就只建一个空库，与旧流程等价。
+  const [file, setFile] = useState<File | null>(null);
+  // 建库与导入是两次请求，但只在这一张卡片里完成。第一步成功后记住 key：
+  // 万一第二步失败，用户可以只重试导入，不会把库建成两个。
+  const [createdKey, setCreatedKey] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const nameRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { nameRef.current?.focus(); }, []);
+
+  const locked = Boolean(createdKey);
+  const primaryLabel = editing
+    ? "保存修改"
+    : createdKey
+      ? (file ? "重试导入" : "完成")
+      : (file ? "创建并导入" : "创建空库");
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    const trimmed = name.trim();
+    if (!trimmed && !createdKey) {
+      setError("请先输入数据库名称。");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    const meta = {
+      name: trimmed,
+      note: note.trim(),
+      tags: tags.split(/[,，]/).map((item) => item.trim()).filter(Boolean),
+    };
+    // 这一次提交里库是否刚被建出来。catch 里不能用 `createdKey` 这个 state 判断：
+    // setCreatedKey() 在同一次 submit 里刚调用，闭包读到的还是旧值（""），
+    // 于是"库已建好、导入失败"时会把错误说成纯粹的导入失败，用户根本不知道库已经建了。
+    let createdNow = false;
+    try {
+      if (editing) {
+        await api(`/api/databases/${encodeURIComponent(initial.key)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(meta),
+        });
+        await onSaved("数据库信息已更新。");
+        return;
+      }
+
+      // 第一步：建库（已经建过就跳过，避免重试导入时撞重名）。
+      let key = createdKey;
+      let displayName = trimmed;
+      if (!key) {
+        const created = await api<{ database: { key: string; name: string } }>("/api/databases", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(meta),
+        });
+        key = created.database.key;
+        displayName = created.database.name;
+        createdNow = true;
+        setCreatedKey(key);
+        // 库这时已经存在了，先把列表刷新出来：即使紧接着导入失败，用户也能看到这个库。
+        await onReload();
+      }
+
+      if (!file) {
+        await onSaved(`数据库「${displayName}」已创建。`);
+        return;
+      }
+
+      // 第二步：导入价目本。
+      const formData = new FormData();
+      formData.set("file", file);
+      const payload = await api<{ inserted: number; skipped_duplicates: number; skipped_invalid: number }>(
+        `/api/databases/${encodeURIComponent(key)}/import`,
+        { method: "POST", body: formData },
+      );
+      const summary = `新增 ${payload.inserted} 条 / 重复跳过 ${payload.skipped_duplicates} 条 / 无效 ${payload.skipped_invalid} 条`;
+      await onSaved(`数据库「${displayName}」已创建，价目本已导入：${summary}。`);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "保存失败";
+      setError(createdNow || createdKey
+        ? `数据库已创建，但价目导入失败：${message}。可点下方按钮重试导入，不用重新建库。`
+        : message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="form-card db-create-card" onSubmit={submit}>
+      <header className="db-create-head">
+        <h3>{editing ? "编辑数据库信息" : "新建价目库"}</h3>
+        <p>
+          {editing
+            ? "只改显示名、标签与备注。文件键不变，库文件与已绑定该库的报价任务都不受影响。"
+            : "命名与上传在同一张卡片里完成：填好名称、选上价目本，一次提交就建库并导入。不选文件则只建一个空库，稍后再补传。"}
+        </p>
+      </header>
+
+      <div className="db-create-grid">
+        <label>
+          <span>数据库名称</span>
+          <input
+            ref={nameRef}
+            value={name}
+            onChange={(event) => { setName(event.target.value); if (error) setError(""); }}
+            placeholder="支持中文，如 赛特尔25年"
+            disabled={locked}
+            required
+          />
+        </label>
+        <label>
+          <span>标签（选填）</span>
+          <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="逗号分隔，如 普教, 高中" disabled={locked} />
+        </label>
+        <label className="db-create-wide">
+          <span>备注 / 用途（选填）</span>
+          <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="如：高中理化生主价目本" disabled={locked} />
+        </label>
+      </div>
+
+      {!editing && (
+        <label className={`import-file db-create-file${file ? " has-file" : ""}`}>
+          <input
+            type="file"
+            accept=".xlsx,.xlsm,.xls,.csv"
+            onChange={(event) => { setFile(event.target.files?.[0] ?? null); if (error) setError(""); }}
+          />
+          <span>{file ? `已选：${file.name}（约 ${Math.max(1, Math.round(file.size / 1024))} KB）` : "＋ 选择价目本 Excel（选填，.xlsx / .xlsm / .xls / .csv）"}</span>
+        </label>
+      )}
+
+      <div className="form-actions">
+        <button className="primary-button" type="submit" disabled={busy}>{busy ? "处理中…" : primaryLabel}</button>
+        <button className="secondary-button" type="button" onClick={onCancel}>取消</button>
+      </div>
+
+      {!editing && (
+        <small className="field-hint">
+          一次提交＝先建库、再导入。文件名键由系统自动生成（ASCII），重命名只改显示名，不会动到库文件。
+        </small>
+      )}
+      {error && <div className="form-error">{error}</div>}
+    </form>
+  );
+}
+
+
+function TableEditPanel({ databases, defaultKey, isAdmin, onReload, notify }: {
+  databases: DatabaseEntry[];
+  defaultKey: string;
+  isAdmin: boolean;
+  onReload: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [pickedKey, setPickedKey] = useState("");
+  const [rows, setRows] = useState<HistoryRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [pages, setPages] = useState(1);
+  const [maxBulkRows, setMaxBulkRows] = useState(2000);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(100);
+  const [keyword, setKeyword] = useState("");
+  const [sort, setSort] = useState("source");
+  const [order, setOrder] = useState<"asc" | "desc">("asc");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [edits, setEdits] = useState<Record<string, { revision: number; base: Record<string, string>; values: Record<string, string> }>>({});
+  const [drafts, setDrafts] = useState<Array<{ tempId: string; values: Record<string, string> }>>([]);
+  const [removed, setRemoved] = useState<Record<string, HistoryRow>>({});
+  const [issues, setIssues] = useState<BulkEditRowResult[]>([]);
+  const [summary, setSummary] = useState("");
+  const [focusId, setFocusId] = useState("");
+  const [opening, setOpening] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [preview, setPreview] = useState<OpenFilePreview | null>(null);
+  // 需指定的行：seq → 用户选中的候选 id。
+  const [picks, setPicks] = useState<Record<number, string>>({});
+  // 用户主动排除掉、这次不写的行（seq）。
+  const [excluded, setExcluded] = useState<Set<number>>(new Set());
+  const [group, setGroup] = useState("change");
+  const fileRef = useRef<HTMLInputElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const scrolledRef = useRef("");
+
+  const options = sortByRecent(databases);
+  const scopeKey = pickedKey || defaultKey;
+
+  const load = useCallback(async (targetPage: number) => {
+    if (!scopeKey) return null;
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        database_key: scopeKey,
+        page: String(targetPage),
+        page_size: String(pageSize),
+        q: keyword.trim(),
+        sort,
+        order,
+      });
+      const payload = await api<HistoryRowsPage>(`/api/history/rows?${params}`);
+      setRows(payload.rows);
+      setTotal(payload.total);
+      setPages(payload.pages);
+      setMaxBulkRows(payload.max_bulk_rows);
+      return payload;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "加载价目行失败");
+      setRows([]);
+      setTotal(0);
+      setPages(1);
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }, [scopeKey, pageSize, keyword, sort, order, notify]);
+
+  // 行数据由服务端持有，按当前筛选与页码拉取就是这个 effect 的同步目的。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { void load(page); }, [load, page]);
+
+  // 跳到冲突行后滚动到它。只滚一次，避免每次翻页都重新滚动。
+  useEffect(() => {
+    if (!focusId || scrolledRef.current === focusId) return;
+    const node = gridRef.current?.querySelector(`[data-row-id="${CSS.escape(focusId)}"]`);
+    if (!node) return;
+    scrolledRef.current = focusId;
+    node.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [focusId, rows]);
+
+  const dirtyIds = Object.keys(edits);
+  const removedIds = Object.keys(removed);
+  const changeCount = dirtyIds.length + drafts.length + removedIds.length;
+  const offPageChanges = dirtyIds.filter((id) => !rows.some((row) => row.id === id)).length;
+  const visibleRows = rows.filter((row) => !removed[row.id]);
+
+  // 本地先校验一遍，避免把必然被拒的行发出去——服务端仍会再校验一次。
+  const localIssues: Array<{ key: string; label: string; message: string }> = [];
+  function checkValues(key: string, label: string, values: Record<string, string>) {
+    if (!values.name.trim()) localIssues.push({ key, label, message: "产品名称不能为空" });
+    const price = values.price.trim();
+    if (price === "") localIssues.push({ key, label, message: "单价不能为空" });
+    else if (!Number.isFinite(Number(price)) || Number(price) < 0) {
+      localIssues.push({ key, label, message: "单价必须是不小于 0 的数字" });
+    }
+    const quantity = values.quantity.trim();
+    if (quantity !== "" && !Number.isFinite(Number(quantity))) {
+      localIssues.push({ key, label, message: "数量必须是数字，或留空表示未知" });
+    }
+  }
+  for (const id of dirtyIds) checkValues(id, edits[id].values.name || id, edits[id].values);
+  drafts.forEach((draft, index) => checkValues(draft.tempId, `新增行 ${index + 1}`, draft.values));
+
+  useEffect(() => {
+    if (changeCount === 0) return;
+    const handler = (event: BeforeUnloadEvent) => { event.preventDefault(); };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [changeCount]);
+
+  function valuesFor(row: HistoryRow): Record<string, string> {
+    return edits[row.id]?.values ?? rowValues(row);
+  }
+
+  function setCell(row: HistoryRow, field: EditableField, value: string) {
+    setEdits((prev) => {
+      const entry = prev[row.id];
+      const base = entry?.base ?? rowValues(row);
+      const values = { ...(entry?.values ?? base), [field]: value };
+      const next = { ...prev };
+      if (EDIT_FIELDS.some((item) => values[item.key] !== base[item.key])) {
+        next[row.id] = { revision: entry?.revision ?? row.revision, base, values };
+      } else {
+        // 改回原值就当没改过，别让"撤销"按钮无意义地亮着。
+        delete next[row.id];
+      }
+      return next;
+    });
+  }
+
+  function setDraftCell(tempId: string, field: EditableField, value: string) {
+    setDrafts((prev) => prev.map((draft) => (
+      draft.tempId === tempId ? { ...draft, values: { ...draft.values, [field]: value } } : draft
+    )));
+  }
+
+  function addRow() {
+    const values: Record<string, string> = {};
+    for (const field of EDIT_FIELDS) values[field.key] = "";
+    setDrafts((prev) => [...prev, { tempId: `draft-${Date.now()}-${prev.length}`, values }]);
+  }
+
+  function undoRow(id: string) {
+    setEdits((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function removeRow(row: HistoryRow) {
+    undoRow(row.id);
+    setRemoved((prev) => ({ ...prev, [row.id]: row }));
+  }
+
+  function undoRemove(id: string) {
+    setRemoved((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function discardAll() {
+    if (!window.confirm(`确定放弃 ${changeCount} 处未保存的改动吗？`)) return;
+    setEdits({});
+    setDrafts([]);
+    setRemoved({});
+    setIssues([]);
+    setSummary("");
+  }
+
+  function changeScope(key: string) {
+    if (key === scopeKey) return;
+    if (changeCount > 0 && !window.confirm(`改选其它库会放弃当前 ${changeCount} 处未保存的改动，确定继续吗？`)) return;
+    setPickedKey(key);
+    setEdits({});
+    setDrafts([]);
+    setRemoved({});
+    setIssues([]);
+    setSummary("");
+    setFocusId("");
+    setPage(1);
+  }
+
+  function resetView(next: () => void) {
+    setFocusId("");
+    next();
+  }
+
+  function toggleSort(field: string) {
+    if (sort === field) setOrder((prev) => (prev === "asc" ? "desc" : "asc"));
+    else {
+      setSort(field);
+      setOrder("asc");
+    }
+    resetView(() => setPage(1));
+  }
+
+  async function jumpTo(conflict: EditConflict) {
+    if (!conflict.id) return;
+    if (rows.some((row) => row.id === conflict.id)) {
+      setFocusId(conflict.id);
+      return;
+    }
+    // 冲突行不在当前页：用它自己的名称搜出来，再按 id 高亮。
+    if (!conflict.name) {
+      notify(`该行不在当前页（${conflict.location ?? "位置未知"}），请用搜索定位。`);
+      return;
+    }
+    scrolledRef.current = "";
+    setKeyword(conflict.name);
+    setPage(1);
+    setFocusId(conflict.id);
+  }
+
+  async function save() {
+    if (localIssues.length > 0 || saving) return;
+    setSaving(true);
+    setSummary("");
+    try {
+      const payload = {
+        database_key: scopeKey,
+        created: drafts.map((draft) => ({ changes: toChanges(draft.values) })),
+        updated: dirtyIds.map((id) => ({ id, revision: edits[id].revision, changes: toChanges(edits[id].values) })),
+        deleted: removedIds.map((id) => ({ id, revision: removed[id].revision })),
+      };
+      const result = await api<BulkEditResponse>("/api/history/bulk-edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const failed = result.results.filter((item) => item.status !== "ok");
+      const okIds = new Set(result.results.filter((item) => item.status === "ok").map((item) => item.id));
+      // 成功的行清掉草稿；被拒绝的留在原地，等用户改完再存一次。
+      setEdits((prev) => {
+        const next = { ...prev };
+        for (const id of Object.keys(next)) if (okIds.has(id)) delete next[id];
+        return next;
+      });
+      setRemoved((prev) => {
+        const next = { ...prev };
+        for (const id of Object.keys(next)) if (okIds.has(id)) delete next[id];
+        return next;
+      });
+      // 新增行按提交顺序一一对应（服务端 results 里的 create 保持入参顺序）。
+      const createResults = result.results.filter((item) => item.op === "create");
+      const failedCreateIndexes = new Set(
+        createResults.map((item, index) => (item.status === "ok" ? -1 : index)).filter((index) => index >= 0),
+      );
+      setDrafts((prev) => prev.filter((_, index) => failedCreateIndexes.has(index)));
+      setIssues(failed);
+      setSummary(
+        `新增 ${result.applied.created} · 修改 ${result.applied.updated} · 删除 ${result.applied.deleted}`
+        + ` · 无变化 ${result.unchanged} · 被拒绝 ${failed.length}`
+        + (result.backup ? ` · 已自动备份 ${result.backup}` : ""),
+      );
+      const written = result.applied.created + result.applied.updated + result.applied.deleted;
+      notify(failed.length ? `已写入 ${written} 处改动，${failed.length} 行被拒绝，请在问题列表里处理。` : `已写入 ${written} 处改动。`);
+      const reloaded = await load(page);
+      if (reloaded && reloaded.rows.length === 0 && reloaded.total > 0 && page > 1) setPage(page - 1);
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function exportCsv() {
+    if (!scopeKey || exporting) return;
+    setExporting(true);
+    try {
+      const cap = 20000;
+      const collected: HistoryRow[] = [];
+      let current = 1;
+      for (;;) {
+        const params = new URLSearchParams({
+          database_key: scopeKey,
+          page: String(current),
+          page_size: "500",
+          q: keyword.trim(),
+          sort,
+          order,
+        });
+        const payload = await api<HistoryRowsPage>(`/api/history/rows?${params}`);
+        collected.push(...payload.rows);
+        if (current >= payload.pages || collected.length >= cap) break;
+        current += 1;
+      }
+      const scoped = collected.slice(0, cap);
+      const lines = [[...EDIT_FIELDS.map((field) => field.label), "来源"].map(csvCell).join(",")];
+      for (const row of scoped) {
+        if (removed[row.id]) continue;
+        const values = valuesFor(row);
+        lines.push([...EDIT_FIELDS.map((field) => values[field.key] ?? ""), rowSource(row)].map(csvCell).join(","));
+      }
+      // 还没保存的新增行也要一起导出，否则用户会以为改动丢了。
+      for (const draft of drafts) {
+        lines.push([...EDIT_FIELDS.map((field) => draft.values[field.key] ?? ""), "表格编辑（未保存）"].map(csvCell).join(","));
+      }
+      const label = options.find((item) => item.key === scopeKey)?.name ?? scopeKey;
+      const blob = new Blob([`\ufeff${lines.join("\r\n")}`], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${label}_价目_${new Date().toISOString().slice(0, 10)}.csv`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      const truncated = collected.length >= cap;
+      notify(`已导出 ${scoped.length} 行（含未保存改动）${truncated ? `，超过 ${cap} 行上限已截断` : ""}。`);
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // ---- 打开本地价目本 ------------------------------------------------------
+  // 分两步：① 打开时只解析比对、不写库，把"会发生什么"逐行摆出来；② 用户确认
+  // 后才把"会改动"的行转成变更集，走和网格保存同一条 bulk-edit 通道——校验、
+  // 乐观锁、去重、备份、审计都在那边，这里不另开第二条写入路径。
+
+  async function openWorkbook(file: File) {
+    if (!scopeKey || opening) return;
+    setOpening(true);
+    try {
+      const form = new FormData();
+      form.append("database_key", scopeKey);
+      form.append("file", file);
+      const payload = await api<OpenFilePreview>("/api/history/open-file", { method: "POST", body: form });
+      setPreview(payload);
+      setPicks({});
+      setExcluded(new Set());
+      const changes = payload.summary.update + payload.summary.create + payload.summary.ambiguous;
+      setGroup(changes > 0 ? "change" : payload.summary.unchanged > 0 ? "unchanged" : "skipped");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "打开价目本失败");
+    } finally {
+      setOpening(false);
+      // 清空 input，否则同一个文件改完再选一次不会触发 onChange。
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  function closePreview() {
+    setPreview(null);
+    setPicks({});
+    setExcluded(new Set());
+  }
+
+  async function applyPreview() {
+    if (!preview || applying) return;
+    const { created, updated, unpicked, writable } = planFromPreview(preview, excluded, picks);
+    if (writable === 0) {
+      notify(unpicked
+        ? `还有 ${unpicked} 行没指定要更新哪一条，这次没有可写入的改动。`
+        : excluded.size > 0 ? "所有行都被排除了，这次没有可写入的改动。" : "这次没有需要写入的改动。");
+      return;
+    }
+    if (unpicked > 0 && !window.confirm(`还有 ${unpicked} 行「需指定」没选，这些行会被跳过。确定继续吗？`)) return;
+    if (writable > preview.max_bulk_rows) {
+      notify(`本次要提交 ${writable} 行，超过单次上限 ${preview.max_bulk_rows.toLocaleString("zh-CN")} 行，请先拆分文件。`);
+      return;
+    }
+    // 网格里的未保存改动走的是另一次提交，不会跟着一起写；先说清楚。
+    if (changeCount > 0 && !window.confirm(`网格里还有 ${changeCount} 处未保存的改动，它们不会被这次应用一起提交。确定继续吗？`)) return;
+
+    setApplying(true);
+    try {
+      const result = await api<BulkEditResponse>("/api/history/bulk-edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          database_key: preview.database_key,
+          created,
+          updated,
+          deleted: [],
+        }),
+      });
+      const failed = result.results.filter((item) => item.status !== "ok");
+      const written = result.applied.created + result.applied.updated;
+      setIssues(failed);
+      setSummary(
+        `打开文件并应用：新增 ${result.applied.created} · 修改 ${result.applied.updated}`
+        + ` · 无变化 ${result.unchanged} · 被拒绝 ${failed.length}`
+        + (result.backup ? ` · 已自动备份 ${result.backup}` : ""),
+      );
+      notify(failed.length
+        ? `已写入 ${written} 行，${failed.length} 行被拒绝，请在问题列表里处理。`
+        : `已写入 ${written} 行。`);
+      closePreview();
+      const reloaded = await load(page);
+      if (reloaded && reloaded.rows.length === 0 && reloaded.total > 0 && page > 1) setPage(page - 1);
+      await onReload();
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "应用失败");
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  const previewGroup = OPEN_FILE_GROUPS.find((item) => item.key === group) ?? OPEN_FILE_GROUPS[0];
+  const previewRows = preview
+    ? preview.rows.filter((row) => previewGroup.actions.includes(row.action))
+    : [];
+  const previewChanges = preview
+    ? preview.summary.create + preview.summary.update + preview.summary.ambiguous
+    : 0;
+  const plan = preview ? planFromPreview(preview, excluded, picks) : null;
+  // 「将改动」组的全部行：全选/全不选按这个集合来，跟当前在哪个分组无关。
+  const changeSeqs = preview
+    ? preview.rows
+      .filter((row) => OPEN_FILE_GROUPS[0].actions.includes(row.action))
+      .map((row) => row.seq)
+    : [];
+  const excludedCount = changeSeqs.filter((seq) => excluded.has(seq)).length;
+  const unpicked = plan?.unpicked ?? 0;
+
+  function toggleExcluded(seq: number, checked: boolean) {
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (checked) next.delete(seq);
+      else next.add(seq);
+      return next;
+    });
+  }
+
+  return (
+    <>
+      <div className="asset-toolbar">
+        <label className="asset-scope">
+          <span>编辑库</span>
+          <select value={scopeKey} onChange={(event) => changeScope(event.target.value)}>
+            {options.map((db) => (
+              <option key={db.key} value={db.key}>
+                {db.name}{db.is_system ? "（系统默认）" : ""} · {db.history_count.toLocaleString("zh-CN")} 条
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="row-search">
+          <input
+            value={keyword}
+            placeholder="按名称 / 参数 / 型号 / 品牌 / 制造商 / 编码 / 来源搜索"
+            onChange={(event) => { setKeyword(event.target.value); resetView(() => setPage(1)); }}
+          />
+          {keyword && <button type="button" onClick={() => { setKeyword(""); resetView(() => setPage(1)); }}>清除</button>}
+        </div>
+        <div className="edit-actions">
+          {isAdmin && <button className="secondary-button" onClick={addRow}>新增一行</button>}
+          {isAdmin && (
+            <>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".xlsx,.xls,.xlsm,.csv"
+                className="edit-file-input"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void openWorkbook(file);
+                }}
+              />
+              <button
+                className="secondary-button"
+                disabled={opening || !scopeKey}
+                onClick={() => fileRef.current?.click()}
+              >
+                {opening ? "正在解析…" : "打开本地 Excel"}
+              </button>
+            </>
+          )}
+          <button className="secondary-button" disabled={exporting || !scopeKey} onClick={() => void exportCsv()}>
+            {exporting ? "正在导出…" : "导出 CSV"}
+          </button>
+          {isAdmin && (
+            <button className="secondary-button" disabled={!changeCount} onClick={discardAll}>放弃改动</button>
+          )}
+          {isAdmin && (
+            <button
+              className="primary-button"
+              disabled={!changeCount || saving || localIssues.length > 0}
+              onClick={() => void save()}
+            >
+              {saving ? "正在保存…" : `保存到数据库${changeCount ? `（${changeCount}）` : ""}`}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="edit-hint">
+        <span>直接在单元格里改；改动过的行会标黄，「保存到数据库」只提交改动过的行（新增 / 修改 / 删除），不做整表覆盖，因此不会影响别人并发导入的数据。保存前会自动备份整个库文件。</span>
+        <span>也可以「打开本地 Excel」把一份价目本带进来：先逐行比对出「会改动 / 无需改动 / 不载入」，确认后才写库；比对时只按文件里确实有的列匹配，没带的列一律保留库里的原值。</span>
+        <span>单价是不含税基准价：价目本里的「含税单价」在导入时已按固定税率折算，导出报价时会再乘回税率。</span>
+        {!isAdmin && <span>当前账号为只读，修改价目需要管理员权限。</span>}
+      </div>
+
+      {summary && <div className="edit-banner">{summary}</div>}
+
+      {removedIds.length > 0 && (
+        <div className="edit-banner edit-banner-removed">
+          <span>已标记删除 {removedIds.length} 行（保存后才会真正从库里删除）</span>
+          <div className="edit-banner-actions">
+            {removedIds.slice(0, 5).map((id) => (
+              <button key={id} type="button" className="text-button" onClick={() => undoRemove(id)}>
+                撤销「{removed[id].name || id}」
+              </button>
+            ))}
+            {removedIds.length > 5 && <span>等 {removedIds.length} 行</span>}
+          </div>
+        </div>
+      )}
+
+      {localIssues.length > 0 && (
+        <div className="edit-issues">
+          <div className="edit-issues-head">
+            <strong>还有 {localIssues.length} 处需要修正才能保存</strong>
+          </div>
+          <ul>
+            {localIssues.map((issue, index) => (
+              <li key={`${issue.key}-${index}`}>
+                <span className="edit-issue-tag bad">校验</span>
+                <span>{issue.label}：{issue.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {issues.length > 0 && (
+        <div className="edit-issues">
+          <div className="edit-issues-head">
+            <strong>有 {issues.length} 行未写入数据库</strong>
+            <button type="button" className="text-button" onClick={() => setIssues([])}>关闭</button>
+          </div>
+          <ul>
+            {issues.map((issue, index) => (
+              <li key={`${issue.op}-${issue.id ?? index}`}>
+                <span className={`edit-issue-tag ${issue.reason === "duplicate_key" ? "warn" : "bad"}`}>
+                  {issue.op === "create" ? "新增" : issue.op === "update" ? "修改" : "删除"}
+                </span>
+                <span>{issue.message ?? "被服务端拒绝"}</span>
+                {issue.conflict?.location && <small>位置：{issue.conflict.location}</small>}
+                {issue.conflict?.id && (
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => { if (issue.conflict) void jumpTo(issue.conflict); }}
+                  >
+                    跳到该行
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="edit-grid-wrap">
+        <div className={`table-scroll edit-grid-scroll${loading ? " loading" : ""}`} ref={gridRef}>
+          <table className="quote-table edit-grid">
+            <thead>
+              <tr>
+                <th className="edit-index-col">#</th>
+                {EDIT_FIELDS.map((field) => (
+                  <th key={field.key} style={{ minWidth: field.width }}>
+                    <button type="button" className="edit-sort" title="点击切换排序" onClick={() => toggleSort(field.key)}>
+                      {field.label}{sort === field.key ? (order === "asc" ? " ↑" : " ↓") : ""}
+                    </button>
+                  </th>
+                ))}
+                <th style={{ minWidth: 180 }}>来源 / 版本</th>
+                {isAdmin && <th style={{ minWidth: 96 }}>操作</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {drafts.map((draft, index) => (
+                <tr key={draft.tempId} className="row-new">
+                  <td className="edit-index-col">新{index + 1}</td>
+                  {EDIT_FIELDS.map((field) => (
+                    <td key={field.key}>
+                      <input
+                        className="edit-input"
+                        value={draft.values[field.key] ?? ""}
+                        inputMode={field.kind === "number" ? "decimal" : undefined}
+                        onChange={(event) => setDraftCell(draft.tempId, field.key, event.target.value)}
+                      />
+                    </td>
+                  ))}
+                  <td><small>尚未保存 · 保存后来源记为「表格编辑」</small></td>
+                  {isAdmin && (
+                    <td>
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => setDrafts((prev) => prev.filter((item) => item.tempId !== draft.tempId))}
+                      >
+                        移除
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+              {visibleRows.map((row, index) => {
+                const values = valuesFor(row);
+                const className = [edits[row.id] ? "row-dirty" : "", focusId === row.id ? "row-focus" : ""]
+                  .filter(Boolean).join(" ");
+                return (
+                  <tr key={row.id} data-row-id={row.id} className={className}>
+                    <td className="edit-index-col">{(page - 1) * pageSize + index + 1}</td>
+                    {EDIT_FIELDS.map((field) => (
+                      <td key={field.key}>
+                        {isAdmin ? (
+                          <input
+                            className="edit-input"
+                            value={values[field.key] ?? ""}
+                            inputMode={field.kind === "number" ? "decimal" : undefined}
+                            onChange={(event) => setCell(row, field.key, event.target.value)}
+                          />
+                        ) : (
+                          <span>{values[field.key]}</span>
+                        )}
+                      </td>
+                    ))}
+                    <td>
+                      <small>{rowSource(row)}</small>
+                      <small>版本 {row.revision} · 质量 {(row.data_quality * 100).toFixed(0)}%</small>
+                    </td>
+                    {isAdmin && (
+                      <td>
+                        {edits[row.id] && (
+                          <button type="button" className="text-button" onClick={() => undoRow(row.id)}>撤销</button>
+                        )}
+                        <button type="button" className="text-button danger" onClick={() => removeRow(row)}>删除</button>
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+              {visibleRows.length === 0 && drafts.length === 0 && (
+                <tr>
+                  <td colSpan={EDIT_FIELDS.length + (isAdmin ? 3 : 2)}>
+                    <div className="edit-empty">
+                      {loading
+                        ? "正在加载价目行…"
+                        : keyword
+                          ? "当前筛选没有匹配的价目行。"
+                          : "该库还没有价目数据。可先到「价目库」上传价目本，或点「新增一行」手工录入。"}
+                    </div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="edit-pager">
+        <span>
+          共 {total.toLocaleString("zh-CN")} 行 · 第 {page} / {pages} 页
+          {offPageChanges > 0 && ` · 另有 ${offPageChanges} 行改动不在本页`}
+          {` · 单次最多提交 ${maxBulkRows.toLocaleString("zh-CN")} 行`}
+        </span>
+        <div>
+          <label className="edit-page-size">
+            <span>每页</span>
+            <select
+              value={pageSize}
+              onChange={(event) => { setPageSize(Number(event.target.value)); resetView(() => setPage(1)); }}
+            >
+              {ROWS_PAGE_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}
+            </select>
+          </label>
+          <button className="secondary-button" disabled={page <= 1 || loading} onClick={() => resetView(() => setPage(1))}>首页</button>
+          <button className="secondary-button" disabled={page <= 1 || loading} onClick={() => resetView(() => setPage(page - 1))}>上一页</button>
+          <button className="secondary-button" disabled={page >= pages || loading} onClick={() => resetView(() => setPage(page + 1))}>下一页</button>
+          <button className="secondary-button" disabled={page >= pages || loading} onClick={() => resetView(() => setPage(pages))}>末页</button>
+        </div>
+      </div>
+
+      {preview && (
+        <div className="modal-backdrop">
+          <div className="openfile-card" role="dialog" aria-label="打开本地 Excel 预览">
+            <header className="openfile-head">
+              <div>
+                <h3>打开「{preview.source}」</h3>
+                <p>
+                  共 {preview.total.toLocaleString("zh-CN")} 行 · 会改动 {previewChanges.toLocaleString("zh-CN")} 行
+                  {plan && plan.writable !== previewChanges
+                    ? ` · 将写入 ${plan.writable.toLocaleString("zh-CN")} 行`
+                    : ""}
+                  {` · 目标库：${options.find((item) => item.key === preview.database_key)?.name ?? preview.database_key}`}
+                </p>
+              </div>
+              <button type="button" onClick={closePreview} disabled={applying} aria-label="关闭">×</button>
+            </header>
+
+            <div className="openfile-notice">
+              这一步只是比对，<strong>没有改动数据库</strong>。确认无误后再点「应用并保存」。
+            </div>
+
+            <div className="openfile-groups">
+              {OPEN_FILE_GROUPS.map((item) => {
+                const count = item.actions.reduce((sum, action) => sum + preview.summary[action], 0);
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className={`openfile-group${group === item.key ? " active" : ""}`}
+                    onClick={() => setGroup(item.key)}
+                  >
+                    {item.title}
+                    <b>{count.toLocaleString("zh-CN")}</b>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="openfile-list">
+              {previewGroup.key === "change" && previewRows.length > 0 && (
+                <div className="openfile-selectbar">
+                  <span>勾掉不想写的行，剩下的才会提交。</span>
+                  <button type="button" className="text-button" onClick={() => setExcluded(new Set())}>全选</button>
+                  <button type="button" className="text-button" onClick={() => setExcluded(new Set(changeSeqs))}>全不选</button>
+                  {excludedCount > 0 && <b>已排除 {excludedCount} 行</b>}
+                </div>
+              )}
+              {previewRows.length === 0 && (
+                <div className="edit-empty">这一组没有行。</div>
+              )}
+              {previewRows.map((row) => {
+                const diff = changeSummary(row.current, row.values);
+                const selectable = previewGroup.key === "change";
+                const dropped = selectable && excluded.has(row.seq);
+                return (
+                  <div key={row.seq} className={`openfile-row is-${row.action}${dropped ? " is-dropped" : ""}`}>
+                    <div className="openfile-row-head">
+                      {selectable && (
+                        <input
+                          type="checkbox"
+                          className="openfile-pick"
+                          checked={!dropped}
+                          onChange={(event) => toggleExcluded(row.seq, event.target.checked)}
+                          aria-label={`${dropped ? "恢复" : "排除"}第 ${row.seq} 行`}
+                        />
+                      )}
+                      <span className={`edit-issue-tag ${row.action === "create" ? "good" : row.action === "update" ? "warn" : "bad"}`}>
+                        {OPEN_FILE_ACTION_LABEL[row.action]}
+                      </span>
+                      <strong>{row.values?.name || row.current?.name || `第 ${row.seq} 行`}</strong>
+                      <small>{row.source}</small>
+                      <small className="openfile-match">按 {row.match_labels.join("/")} 匹配</small>
+                      {dropped && <small className="openfile-dropped">已排除，这次不写</small>}
+                    </div>
+                    <div className="openfile-row-body">
+                      <span className="openfile-reason">{row.reason}</span>
+                      {diff.length > 0 && (
+                        <>
+                          {row.action === "ambiguous" && (
+                            <small className="openfile-difflabel">文件里这一行是（选定候选后按这个改）：</small>
+                          )}
+                          <ul className="openfile-diff">
+                            {diff.map((line, index) => <li key={index}>{line}</li>)}
+                          </ul>
+                        </>
+                      )}
+                      {row.action === "ambiguous" && (
+                        <div className="openfile-candidates">
+                          <span>库里有多条，选一条作为更新目标：</span>
+                          {row.targets.map((target) => (
+                            <label key={target.id} className={`openfile-candidate${picks[row.seq] === target.id ? " picked" : ""}`}>
+                              <input
+                                type="radio"
+                                name={`pick-${row.seq}`}
+                                checked={picks[row.seq] === target.id}
+                                onChange={() => setPicks((prev) => ({ ...prev, [row.seq]: target.id }))}
+                              />
+                              <b>{target.price ?? "—"}</b>
+                              <small>{target.location} · 版本 {target.revision}</small>
+                              <small>{changeSummary(target.current, target.values).join("；") || "无差异"}</small>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                      {row.warnings.length > 0 && (
+                        <ul className="openfile-warnings">
+                          {row.warnings.map((text, index) => <li key={index}>{text}</li>)}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <footer className="openfile-foot">
+              <span>
+                {[
+                  excludedCount > 0 ? `已排除 ${excludedCount} 行。` : "",
+                  unpicked > 0 ? `还有 ${unpicked} 行「需指定」没选，未选的行不会写入。` : "",
+                  "「无需改动」和「不载入」的行不会写入。",
+                ].filter(Boolean).join("")}
+              </span>
+              <div>
+                <button className="secondary-button" onClick={closePreview} disabled={applying}>取消</button>
+                <button
+                  className="primary-button"
+                  onClick={() => void applyPreview()}
+                  disabled={applying || !plan || plan.writable === 0}
+                >
+                  {applying ? "正在写入…" : `应用并保存${plan?.writable ? `（${plan.writable}）` : ""}`}
+                </button>
+              </div>
+            </footer>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function GovernancePanel({ databases, defaultKey, fallback, isAdmin, onReload, notify }: {
+  databases: DatabaseEntry[];
+  defaultKey: string;
+  fallback: Governance | null;
+  isAdmin: boolean;
+  onReload: () => Promise<void>;
+  notify: (message: string) => void;
+}) {
+  const [pickedKey, setPickedKey] = useState("");
+  const [data, setData] = useState<Governance | null>(fallback);
+  const [dedupBusy, setDedupBusy] = useState(false);
+  const options = sortByRecent(databases);
+  const scopeKey = pickedKey || defaultKey;
+
+  const loadSummary = useCallback(async (key: string) => {
+    const query = key ? `?database_key=${encodeURIComponent(key)}` : "";
+    setData(await api<Governance>(`/api/governance/summary${query}`));
+  }, []);
+
+  // 治理摘要由服务端持有，拉取所选库的摘要就是这个 effect 的同步目的。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { if (scopeKey) void loadSummary(scopeKey); }, [loadSummary, scopeKey]);
+
+  async function dedup() {
+    setDedupBusy(true);
+    try {
+      const result = await api<{ removed: number }>("/api/governance/dedup-history", { method: "POST" });
+      notify(`本次合并 ${result.removed} 条重复记录。`);
+      await Promise.all([loadSummary(scopeKey), onReload()]);
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "去重失败");
+    } finally {
+      setDedupBusy(false);
+    }
+  }
+
+  if (!data) return <section><div className="empty-state">正在加载治理摘要…</div></section>;
+
+  return (
+    <>
+      <div className="asset-toolbar">
+        <label className="asset-scope">
+          <span>查看库</span>
+          <select value={scopeKey} onChange={(event) => setPickedKey(event.target.value)}>
+            {options.map((db) => (
+              <option key={db.key} value={db.key}>{db.name}{db.is_system ? "（系统默认）" : ""}</option>
+            ))}
+          </select>
+        </label>
+        {isAdmin && (
+          <button className="primary-button" disabled={dedupBusy} onClick={() => void dedup()}>
+            {dedupBusy ? "正在去重…" : "一键去重历史报价"}
+          </button>
+        )}
+      </div>
+      <div className="governance-grid">
+        <Metric label="历史记录" value={data.record_count} tone="teal" />
+        <Metric label="同名重复组" value={data.duplicate_name_groups} tone="slate" />
+        <Metric label="同名多单位组" value={data.unit_conflict_groups} tone="red" />
+        <Metric label="同名多价格组" value={data.price_conflict_groups} tone="amber" />
+        <Metric label="缺制造商记录" value={data.missing_manufacturer_count} tone="blue" />
+        <Metric label="审计事件" value={data.audit_event_count} tone="slate" />
+      </div>
+      <div className="governance-panels">
+        <article>
+          <p className="eyebrow">MATCHING POLICY</p>
+          <h3>当前匹配权重</h3>
+          <div className="weight-list">
+            {Object.entries(data.matching_weights).map(([label, value]) => (
+              <div key={label}><span>{label}</span><i><b style={{ width: `${value * 2}%` }} /></i><strong>{value}%</strong></div>
+            ))}
+          </div>
+          <p>编码精确命中优先；低于55分不作为可靠匹配；阻断风险不能被批量确认。</p>
+        </article>
+        <article>
+          <p className="eyebrow">UNIT POLICY</p>
+          <h3>单位校验边界</h3>
+          <ul>
+            <li><b>绿色</b>单位完全一致</li>
+            <li><b>橙色</b>克/千克、毫升/升等可换算</li>
+            <li><b>红色</b>瓶/盒/套与克等不可直接换算</li>
+          </ul>
+          <p>包装单位只有在记录净含量后才能折算，避免错误单价进入客户报价。</p>
+        </article>
+      </div>
+    </>
+  );
+}
+
+function AuditPanel() {
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api<AuditEvent[]>("/api/audit-events?limit=100")
+      .then(setEvents)
+      .catch(() => setEvents([]))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div className="empty-state">正在加载审计事件…</div>;
+  if (events.length === 0) return <div className="empty-state compact"><strong>暂无审计事件</strong><span>导入价目、去重、切库等操作都会留下记录。</span></div>;
+
+  return (
+    <div className="table-scroll">
+      <table className="quote-table">
+        <thead>
+          <tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr>
+        </thead>
+        <tbody>
+          {events.map((event) => (
+            <tr key={event.id}>
+              <td className="mono">{formatDate(event.created_at)}</td>
+              <td>{event.user?.display_name ?? "—"}</td>
+              <td className="mono">{event.action}</td>
+              <td>{event.entity_type} · {event.entity_id}</td>
+              <td><small>{JSON.stringify(event.detail)}</small></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function ChangePasswordModal({ onClose, notify }: { onClose: () => void; notify: (message: string) => void }) {
@@ -1423,174 +3056,86 @@ function ChangePasswordModal({ onClose, notify }: { onClose: () => void; notify:
   );
 }
 
-function DatabaseSwitcher({ onChanged, notify }: { onChanged: () => Promise<void>; notify: (message: string) => void }) {
-  const [data, setData] = useState<DatabaseList | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+function DatabasePicker({ value, onChange, label = "选择价目库" }: {
+  value: string;
+  onChange: (key: string, name: string) => void;
+  label?: string;
+}) {
+  const [entries, setEntries] = useState<DatabaseEntry[]>([]);
+  const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [systemKey, setSystemKey] = useState("");
+  const [searched, setSearched] = useState<{ query: string; items: DatabaseEntry[] }>({ query: "", items: [] });
 
-  const load = useCallback(async () => {
-    try {
-      setData(await api<DatabaseList>("/api/databases"));
-      setError("");
-    } catch {
-      setError("无法连接服务器，请确认后端已启动后点重试");
-    }
-  }, []);
-  // Fetching the server-owned database list is the synchronization purpose of this effect.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const query = expanded ? "scope=all&limit=50" : "scope=recent&limit=5";
+    api<DatabaseSearchResult>(`/api/databases/search?${query}`)
+      .then((payload) => { setEntries(payload.databases); setSystemKey(payload.system); })
+      .catch(() => setEntries([]))
+      .finally(() => setLoading(false));
+  }, [expanded]);
 
-  async function switchTo(name: string) {
-    setBusy(true);
-    setError("");
-    try {
-      await api<{ ok: boolean }>("/api/databases/switch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      notify(`已切换到数据库「${name}」`);
-      await load();
-      await onChanged();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "切换失败");
-    } finally {
-      setBusy(false);
-    }
-  }
+  const keyword = search.trim();
+  useEffect(() => {
+    if (!keyword) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api<DatabaseSearchResult>(`/api/databases/search?q=${encodeURIComponent(keyword)}&limit=20`)
+        .then((payload) => { if (!cancelled) setSearched({ query: keyword, items: payload.databases }); })
+        .catch(() => { if (!cancelled) setSearched({ query: keyword, items: [] }); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [keyword]);
 
-  const current = data?.databases.find((db) => db.name === data.current) ?? null;
-
-  if (data === null && error) {
-    return (
-      <div className="db-switcher">
-        <div className="form-error">{error}</div>
-        <button className="secondary-button" style={{ marginTop: 10 }} onClick={() => void load()}>重试</button>
-      </div>
-    );
-  }
+  // 只采用与当前关键词对应的结果，避免旧结果串场。
+  const matched = searched.query === keyword ? searched.items : [];
+  const list = keyword ? matched : entries;
+  const selected = [...entries, ...matched].find((item) => item.key === value) ?? null;
+  const systemName = [...entries, ...matched].find((item) => item.key === systemKey)?.name ?? "";
 
   return (
-    <div className="db-switcher">
-      <div className="db-switcher-chips">
-        {(data?.databases ?? []).map((db) => {
-          const active = db.name === data?.current;
-          return (
-            <button
-              key={db.name}
-              type="button"
-              className={`db-chip ${active ? "active" : ""}`}
-              disabled={busy || active}
-              onClick={() => void switchTo(db.name)}
-              title={db.exists ? `${db.history_count.toLocaleString("zh-CN")} 条历史 · ${db.job_count} 个任务 · ${db.size_mb} MB` : "尚未创建"}
-            >
-              <strong>{db.name}</strong>
-              <span>{active ? "● 当前" : db.exists ? `${db.history_count.toLocaleString("zh-CN")} 条历史` : "尚未创建"}</span>
-            </button>
-          );
-        })}
+    <>
+      <div className="step-label"><b>02</b><span>{label}</span></div>
+      <div className="row-search customer-picker-search">
+        <span>⌕</span>
+        <input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="输入库名搜索，留空显示最近常用"
+        />
       </div>
-      {error && <div className="form-error" style={{ marginTop: 8 }}>{error}</div>}
-      {current && (
-        <p className="db-switcher-note">
-          当前库「{current.name}」共 {current.history_count.toLocaleString("zh-CN")} 条历史报价、{current.job_count} 个任务（{current.size_mb} MB）。上传询价单前请确认已切换到正确的数据库。
+      <div className="customer-picker-list db-picker-list">
+        <button type="button" className={value ? "" : "active"} onClick={() => onChange("", "")}>
+          <strong>不指定，用系统默认库</strong>
+          <span>{systemName ? `系统默认库是「${systemName}」` : "系统默认库（改配置才能换，界面上不切换）"}</span>
+        </button>
+        {loading && <small className="picker-empty">正在加载数据库…</small>}
+        {!loading && list.length === 0 && (
+          <small className="picker-empty">{keyword ? "没有匹配的数据库" : "还没有可用的价目库"}</small>
+        )}
+        {list.map((db) => (
+          <button type="button" key={db.key} className={value === db.key ? "active" : ""} onClick={() => onChange(db.key, db.name)}>
+            <strong>{db.name}{db.is_system ? " · 系统默认" : ""}</strong>
+            <span>{db.history_count.toLocaleString("zh-CN")} 条价目 · {db.exists ? formatRelative(db.last_used_at) : "库文件缺失"}</span>
+          </button>
+        ))}
+      </div>
+      {!keyword && !expanded && (
+        <button type="button" className="text-button" onClick={() => setExpanded(true)}>查看全部数据库 →</button>
+      )}
+      {!keyword && expanded && (
+        <button type="button" className="text-button" onClick={() => setExpanded(false)}>只看最近常用 ←</button>
+      )}
+      {selected && (
+        <p className="picker-selected">
+          本次报价使用「{selected.name}」，共 {selected.history_count.toLocaleString("zh-CN")} 条价目记录。
         </p>
       )}
-    </div>
-  );
-}
-
-function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>; notify: (message: string) => void }) {
-  const [data, setData] = useState<DatabaseList | null>(null);
-  const [newName, setNewName] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    try {
-      setData(await api<DatabaseList>("/api/databases"));
-      setError("");
-    } catch {
-      setError("无法连接服务器，请确认后端已启动后点重试");
-    }
-  }, []);
-  // Fetching the server-owned database list is the synchronization purpose of this effect.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { void load(); }, [load]);
-
-  async function createNew(event: FormEvent) {
-    event.preventDefault();
-    const name = newName.trim();
-    if (!name) {
-      setError("请先输入数据库名称");
-      return;
-    }
-    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
-      setError("数据库名称只能包含字母、数字、下划线、连字符（如 saitel_demo）");
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      await api<{ ok: boolean }>("/api/databases/switch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      notify(`已新建并切换到空库「${name}」，请到「数据治理」导入价目本`);
-      setNewName("");
-      await load();
-      await onChanged();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "新建失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <section>
-      <PageHeading eyebrow="DATABASE ADMINISTRATION" title="数据库管理" detail="新建空库、查看已有库。切换数据库请到「新建报价」操作；新建后请到「数据治理」导入价目本。" />
-      {error && <div className="form-error">{error}</div>}
-      <div className="form-card import-card">
-        <div>
-          <h3>新建空库</h3>
-          <p>输入库名（字母/数字/下划线，如 saitel_demo）→ 新建并自动切换。随后在「数据治理」上传赛特尔25年.xls 等价目本。</p>
-        </div>
-        <form onSubmit={createNew} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <input
-            value={newName}
-            onChange={(event) => { setNewName(event.target.value); if (error) setError(""); }}
-            placeholder="输入库名，如 saitel_demo"
-            autoFocus
-            style={{ flex: 1, minWidth: 220 }}
-          />
-          <button className="primary-button" type="submit" disabled={busy}>{busy ? "处理中…" : "新建并切换"}</button>
-        </form>
-      </div>
-      <div className="governance-grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))" }}>
-        {data === null && error && (
-          <article className="db-card" style={{ padding: 16, border: "1px solid var(--line)", borderRadius: 12, background: "white" }}>
-            <p style={{ margin: 0, color: "var(--muted)", fontSize: 10 }}>数据库列表加载失败</p>
-            <button className="secondary-button" style={{ marginTop: 10 }} onClick={() => void load()}>重试</button>
-          </article>
-        )}
-        {(data?.databases ?? []).map((db) => {
-          const active = db.name === data?.current;
-          return (
-            <article key={db.name} className="db-card" style={{ padding: 16, border: active ? "2px solid var(--teal)" : "1px solid var(--line)", borderRadius: 12, background: "white" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <h3 style={{ margin: 0 }}>{db.name}{active && <span style={{ color: "var(--teal)", fontSize: 10, marginLeft: 8 }}>● 当前</span>}</h3>
-                {db.exists && <strong style={{ color: "#994a10" }}>{db.history_count.toLocaleString("zh-CN")} 条</strong>}
-              </div>
-              <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: 10 }}>
-                {db.exists ? `${db.size_mb} MB · ${db.job_count} 个任务` : "尚未创建"}
-              </p>
-            </article>
-          );
-        })}
-      </div>
-    </section>
+      {!selected && !value && (
+        <p className="picker-selected muted">未指定价目库时，使用系统默认库{systemName ? `「${systemName}」` : ""}。</p>
+      )}
+    </>
   );
 }
 
@@ -1604,12 +3149,7 @@ function AccountAdmin({ notify }: { notify: (message: string) => void }) {
   const [resetTarget, setResetTarget] = useState<AccountUser | null>(null);
 
   const loadAccounts = useCallback(async () => {
-    try {
-      setAccounts(await api<AccountUser[]>("/api/users"));
-      setError("");
-    } catch {
-      setError("无法连接服务器，请确认后端已启动后点重试");
-    }
+    setAccounts(await api<AccountUser[]>("/api/users"));
   }, []);
   // Fetching the server-owned account list is the synchronization purpose of this effect.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -1661,11 +3201,6 @@ function AccountAdmin({ notify }: { notify: (message: string) => void }) {
         {error && <div className="form-error">{error}</div>}
       </form>
       <div className="review-card">
-        {accounts.length === 0 && error && (
-          <div style={{ padding: "13px 14px", borderBottom: "1px solid var(--line)" }}>
-            <button className="secondary-button" onClick={() => void loadAccounts()}>重试</button>
-          </div>
-        )}
         <div className="table-scroll account-table">
           <table className="quote-table">
             <thead><tr><th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>

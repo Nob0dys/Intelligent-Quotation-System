@@ -33,8 +33,16 @@ JY_MAJOR = {
 
 @lru_cache(maxsize=65536)
 def jy_major(code: str) -> str:
-    text = _norm(code)
-    if len(text) < 2 or not text[:2].isdigit():
+    """5 位 JY 编码的大类；其它形式（11+ 位新课标分类代码、含字母）不做判断。
+
+    新课标分类代码（30307216301）前两位恰好是 ``30``，按旧表会误判成“光学”，
+    必须排除，否则会以错误大类把真实候选硬过滤掉。
+    """
+    raw = unicodedata.normalize("NFKC", str(code or "")).strip()
+    if raw.endswith(".0") and raw[:-2].isdigit():
+        raw = raw[:-2]
+    text = _norm(raw)
+    if len(text) != 5 or not text.isdigit():
         return ""
     return JY_MAJOR.get(text[:2], "")
 

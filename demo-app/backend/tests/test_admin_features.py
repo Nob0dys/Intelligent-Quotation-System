@@ -124,16 +124,16 @@ def test_export_multi_option_quantity_and_totals():
         workbook = load_workbook(BytesIO(export.content))
         sheet = workbook["询价单"]
         header_values = [cell.value for cell in sheet[1]]
-        for label in ("数量", "确认单价", "总价", "品牌", "制造商", "型号",
+        for label in ("数量", "报价1单价", "总价", "报价1品牌", "报价1制造商", "报价1型号",
                       "报价2单价", "报价2制造商", "报价3单价", "报价3制造商"):
             assert label in header_values
         # 复用原表已有的 单位/数量 列，不追加重复列（旧版会追加重 数量/单位）
         normalized = [str(v).strip() for v in header_values if v]
         duplicated = [x for x in set(normalized) if normalized.count(x) > 1]
         assert not duplicated, f"导出表头出现重复列: {duplicated}"
-        # 数量 / 确认单价 / 总价 written for the confirmed line (row 2)
+        # 数量 / 报价1单价 / 总价 written for the confirmed line (row 2)
         quantity_col = header_values.index("数量") + 1
-        price_col = header_values.index("确认单价") + 1
+        price_col = header_values.index("报价1单价") + 1
         total_col = header_values.index("总价") + 1
         quantity = sheet.cell(2, quantity_col).value
         price = sheet.cell(2, price_col).value
@@ -149,7 +149,32 @@ def test_export_multi_option_quantity_and_totals():
         assert tax_unit == round(price * 1.1, 2)
         assert tax_total == round(price * 1.1 * quantity, 2)
         # 产品编码列存在（本测试无编码记录，应为空字符串即可，但列必须出现）
-        assert "产品编码" in header_values
+        assert "报价1产品编码" in header_values
+
+        # 报价2/报价3 必须与"报价1"一样带齐描述列：旧版只有 单价+制造商，
+        # 导致多方案报价里后续方案没有品牌/型号/产品编码/规格。
+        for prefix in ("报价2", "报价3"):
+            for suffix in ("单价", "制造商", "品牌", "型号", "产品编码", "规格"):
+                assert f"{prefix}{suffix}" in header_values, f"缺少列 {prefix}{suffix}"
+
+        # 后续方案的取值必须来自对应方案本身
+        detail_line = client.get(f"/api/quote-lines/{line['id']}").json()
+        selected_options = sorted(
+            (item for item in detail_line["options"] if item["selected"]),
+            key=lambda item: item["rank"],
+        )
+        assert len(selected_options) == 3
+        for index, option in enumerate(selected_options[1:], start=2):
+            brand_col = header_values.index(f"报价{index}品牌") + 1
+            maker_col = header_values.index(f"报价{index}制造商") + 1
+            assert (sheet.cell(2, brand_col).value or "") == (option["record"]["brand"] or "")
+            assert (sheet.cell(2, maker_col).value or "") == (option["record"]["manufacturer"] or "")
+        # 至少有一个后续方案带出了非空描述信息，证明列组确实被写入而非空列
+        assert any(
+            (sheet.cell(2, header_values.index(f"报价{index}品牌") + 1).value or "")
+            or (sheet.cell(2, header_values.index(f"报价{index}制造商") + 1).value or "")
+            for index in (2, 3)
+        )
 
         detail = workbook["多方案报价明细"]
         detail_headers = [cell.value for cell in detail[1]]
@@ -170,38 +195,101 @@ def test_export_multi_option_quantity_and_totals():
         assert "报价2单价" in internal_headers
 
 
-def test_export_appends_without_overwriting_original_price():
-    """原表已有“单价”列时：确认结果追加到新的“确认单价”列，原值保持不变；
-    数量/总价/税后总价必须随导出生成（合并表头“参考数量”也要识别）。"""
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "清单"
-    sheet.append(["序号", "产品名称", "参数", "型号", "单位", "参考数量", "单价"])
-    sheet.append([1, "电子天平", "100g，0.001g，带防风罩", "", "台", 2, 999])
-    stream = BytesIO()
-    workbook.save(stream)
+def test_export_skips_empty_extra_option_columns():
+    """方案数填 3、整单实际只选 1 个方案时，不应留下一整组空列。"""
     with TestClient(app) as client:
         login(client)
-        job_id = create_job(client, ordinary_customer_id(client), stream.getvalue())
-        export = client.post(f"/api/quote-jobs/{job_id}/auto-confirm-and-export/internal")
-        assert export.status_code == 200, export.text
-        exported = load_workbook(BytesIO(export.content))
-        sheet2 = exported["清单"]
-        header_values = [cell.value for cell in sheet2[1]]
-        original_col = header_values.index("单价") + 1
-        # 原有内容不被覆盖
-        assert sheet2.cell(2, original_col).value == 999
-        # 确认结果在新列
-        confirm_col = header_values.index("确认单价") + 1
-        confirmed = sheet2.cell(2, confirm_col).value
-        assert confirmed and confirmed != 999
-        # 数量 / 总价 / 税后总价已生成
-        quantity_col = header_values.index("参考数量") + 1
-        total_col = header_values.index("总价") + 1
-        tax_total_col = header_values.index("税后总价") + 1
-        assert sheet2.cell(2, quantity_col).value == 2
-        assert sheet2.cell(2, total_col).value == round(confirmed * 2, 2)
-        assert sheet2.cell(2, tax_total_col).value == round(confirmed * 1.1 * 2, 2)
+        job_id = create_job(client, ordinary_customer_id(client), option_count=3)
+        lines = client.get(f"/api/quote-jobs/{job_id}/lines").json()
+        line = client.get(f"/api/quote-lines/{lines['items'][0]['id']}").json()
+        assert line["options"]
+        update_response = client.patch(
+            f"/api/quote-lines/{line['id']}",
+            json={
+                "selected_option_ids": [line["options"][0]["id"]],
+                "final_prices": {},
+                "manual_note": "",
+            },
+        )
+        assert update_response.status_code == 200, update_response.text
+
+        export = client.post(f"/api/quote-jobs/{job_id}/export/customer")
+        assert export.status_code == 200
+        workbook = load_workbook(BytesIO(export.content))
+        header_values = [cell.value for cell in workbook["询价单"][1]]
+        assert "报价2单价" not in header_values
+        assert "报价2品牌" not in header_values
+        assert "报价3单价" not in header_values
+
+
+def test_export_extra_options_follow_confirmation_state():
+    """客户版对未确认行不写价，"报价2/报价3"列组必须与"报价1"同一口径。
+
+    回归点：旧实现只给"报价1"加了 line.confirmed 判断，备选方案列无条件写入，
+    结果未确认行的候选价会提前出现在客户版询价单里。
+    """
+    with TestClient(app) as client:
+        login(client)
+        content = workbook_bytes([
+            [1, "电子天平", "100g，0.001g，带防风罩", "", "台", 2],
+            [2, "电子天平", "200g，0.001g，带防风罩", "", "台", 3],
+        ])
+        job_id = create_job(client, ordinary_customer_id(client), content, option_count=3)
+        lines = client.get(f"/api/quote-jobs/{job_id}/lines").json()["items"]
+        assert len(lines) >= 2, "该夹具需要至少两行才能区分已确认/未确认"
+
+        def pick_three(line_id: int):
+            detail = client.get(f"/api/quote-lines/{line_id}").json()
+            chosen = [item["id"] for item in detail["options"]][:3]
+            assert len(chosen) == 3, "需要至少 3 个候选方案"
+            response = client.patch(
+                f"/api/quote-lines/{line_id}",
+                json={"selected_option_ids": chosen, "final_prices": {}, "manual_note": ""},
+            )
+            assert response.status_code == 200, response.text
+
+        confirmed_id = lines[0]["id"]
+        pending_id = lines[1]["id"]
+        pick_three(confirmed_id)
+        pick_three(pending_id)
+        # 只确认第一行，第二行保持未确认
+        assert client.post(
+            f"/api/quote-lines/{confirmed_id}/confirm", json={"override_reason": "测试"}
+        ).status_code == 200
+
+        export = client.post(f"/api/quote-jobs/{job_id}/export/customer")
+        assert export.status_code == 200
+        sheet = load_workbook(BytesIO(export.content))["询价单"]
+        header_values = [cell.value for cell in sheet[1]]
+        # 已确认行需要 3 个方案，所以列组必须存在
+        for suffix in ("单价", "制造商", "品牌", "型号", "产品编码", "规格"):
+            assert f"报价2{suffix}" in header_values, f"缺少列 报价2{suffix}"
+
+        def row_for(source_row: int):
+            """导出保留原表行号：表头在第 1 行，数据行号即原表行号。"""
+            return source_row
+
+        confirmed_row = row_for(lines[0]["source_row"])
+        pending_row = row_for(lines[1]["source_row"])
+        price_col = header_values.index("报价2单价") + 1
+
+        assert sheet.cell(confirmed_row, price_col).value not in (None, ""), "已确认行应写入报价2单价"
+        assert sheet.cell(pending_row, price_col).value in (None, ""), (
+            "未确认行不应在客户版写入报价2单价"
+        )
+        # 报价1 的口径不变，作为对照
+        primary_col = header_values.index("报价1单价") + 1
+        assert sheet.cell(pending_row, primary_col).value in (None, "")
+
+        # 内部复核版对所有行都写出，两行都应有值
+        internal = client.post(f"/api/quote-jobs/{job_id}/export/internal")
+        assert internal.status_code == 200
+        internal_sheet = load_workbook(BytesIO(internal.content))["询价单"]
+        internal_headers = [cell.value for cell in internal_sheet[1]]
+        internal_price_col = internal_headers.index("报价2单价") + 1
+        assert internal_sheet.cell(pending_row, internal_price_col).value not in (None, ""), (
+            "内部复核版应写出未确认行的备选方案价"
+        )
 
 
 def test_job_rename_and_delete():

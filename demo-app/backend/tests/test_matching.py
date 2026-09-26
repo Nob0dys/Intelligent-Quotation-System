@@ -223,3 +223,186 @@ def test_parameter_similarity_range_comparison():
     # Identical 3D dimensions
     sim = parameter_similarity("250mm×180mm×100mm", "250mm×180mm×100mm")
     assert sim >= 0.9
+
+
+def test_equal_range_is_not_a_variant_mismatch():
+    """同值量程不得误报“规格量程不符”（100mm vs 100mm），否则正确候选被踢出默认池。"""
+    from app.matching import variant_penalty
+    penalty, warnings = variant_penalty(
+        {"name": "量筒", "spec": "100ml"},
+        {"name": "量筒", "spec": "100ml，分度值1ml"},
+    )
+    assert not any("量程不符" in warning for warning in warnings)
+    assert penalty == 0
+
+
+def test_name_core_normalizes_price_book_suffix_and_terminology():
+    """价目本导出的尾字母脏后缀与 磁体/磁铁 术语要归一，同名加分才能生效。"""
+    assert name_core("光的传播、反射、折射实验器c") == name_core("光的传播、反射、折射实验器")
+    assert name_core("LED光源a") == name_core("LED光源")
+    assert name_core("蹄形磁铁") == name_core("蹄形磁体")
+
+
+def test_jy_major_only_applies_to_five_digit_codes():
+    """11 位新课标分类代码（30307216301）不得按旧表前两位误判成“光学”。"""
+    from app.category import jy_major
+    assert jy_major("02011") == "通用仪器"
+    assert jy_major("30307216301") == ""
+    assert jy_major("30307216301.0") == ""
+    assert jy_major("S7261") == ""
+
+
+def test_normalize_code_strips_export_dot_zero():
+    from app.matching import normalize_code
+    assert normalize_code("30307216301.0") == "30307216301"
+    assert normalize_code("02045") == "02045"
+    assert normalize_code("") == ""
+
+
+def test_same_name_price_spread_is_not_penalized():
+    """同名多规格（电阻箱 45/80）的价差是版本差异，价格一致性不得把高配版扣分。"""
+    cheap = record(id="cheap", name="电阻箱", spec="", price=45, unit="个", source_file="赛特尔25年.xls")
+    rich = record(id="rich", name="电阻箱", spec="六位99999.9Ω，0.1级", price=80, unit="个", source_file="赛特尔25年.xls")
+    peer_plain = record(id="peer1", name="电阻箱", spec="四位9999Ω", price=45, unit="个", source_file="赛特尔25年.xls")
+    peer_other = record(id="peer2", name="教学电阻箱", spec="9999.9Ω", price=65, unit="个", source_file="赛特尔25年.xls")
+    candidates = match_line(
+        {"name": "电阻箱", "spec": "/", "unit": "个", "product_code": "", "model": "",
+         "brand": "", "manufacturer": ""},
+        [cheap, rich, peer_plain, peer_other],
+    )
+    by_id = {candidate.record["id"]: candidate for candidate in candidates}
+    assert by_id["cheap"].component_scores["价格一致性"] == 6.0
+    assert by_id["rich"].component_scores["价格一致性"] == 6.0
+
+
+def test_suffix_cleanup_lets_new_standard_item_win_exact_name():
+    """“光的传播、反射、折射实验器c”清洗后应拿到精确同名加分，压过无规格旧版。"""
+    old = record(
+        id="old", name="光的传播、反射、折射实验器", spec="", price=22, unit="台",
+        source_file="赛特尔25年.xls",
+    )
+    new = record(
+        id="new", name="光的传播、反射、折射实验器c",
+        spec="包括能显示光路的透明材料制成的半圆玻砖、角度板、两个条形玻砖、半导体激光光源等",
+        price=58, unit="台", source_file="赛特尔25年.xls",
+    )
+    candidates = match_line(
+        {"name": "光的传播、反射、折射实验器", "spec": "/", "unit": "台", "product_code": "",
+         "model": "", "brand": "", "manufacturer": ""},
+        [old, new],
+    )
+    assert candidates[0].record["id"] == "new"
+
+
+def _saitel_record(record_id, name, spec, unit, price, code="", sheet=""):
+    return record(
+        id=record_id, name=name, spec=spec, unit=unit, price=price, product_code=code,
+        source_sheet=sheet, source_file="赛特尔25年.xls", model="",
+    )
+
+
+def _plain_line(name, spec, unit, code=""):
+    return {
+        "name": name, "spec": spec, "unit": unit, "product_code": code,
+        "model": "", "brand": "", "manufacturer": "",
+    }
+
+
+def test_spec_range_phi_prefix_on_both_numbers():
+    """φ5～φ6mm / φ5mm～φ6mm 必须解析成同一范围，不得互报量程不符。"""
+    from app.matching import spec_ranges, variant_penalty
+    assert spec_ranges("φ5～φ6mm")["mm"] == (5.0, 6.0)
+    assert spec_ranges("φ5mm～φ6mm")["mm"] == (5.0, 6.0)
+    penalty, warnings = variant_penalty(
+        {"name": "玻璃棒", "spec": "φ5～φ6mm，长≥300mm，高硼硅"},
+        {"name": "玻璃棒", "spec": "φ5mm～φ6mm"},
+    )
+    assert not any("量程不符" in warning for warning in warnings)
+
+
+def test_multi_value_compare_ignores_irrelevant_number():
+    """手摇离心转台：140mm（支杆距离）不得与候选支杆直径 10mm 误报量程不符。"""
+    from app.matching import variant_penalty
+    penalty, warnings = variant_penalty(
+        {"name": "手摇离心转台", "spec": "从动轮轴心与支杆中心距离≥140mm，轴孔上段≥Ф10mm"},
+        {"name": "手摇离心转台", "spec": "支杆直径 10 mm，全长 140 mm"},
+    )
+    assert not any("量程不符" in warning for warning in warnings)
+
+
+def test_dissecting_toolkit_count_discrimination():
+    """解剖器 7件/4件 必须区分：不能两个规格同价。"""
+    seven = _saitel_record("7件", "解剖器", "7件", "套", 22, "27001", "初中生物")
+    four = _saitel_record("4件", "解剖器", "4件", "套", 14, "27002", "初中生物")
+    line7 = _plain_line("解剖器", "1、规格：7件 2、由解剖器和定位包装袋组成，不锈钢", "套")
+    line4 = _plain_line("解剖器", "1、规格：4件 2、由剪刀、镊子、解剖刀、解剖针组成", "套")
+    assert match_line(line7, [seven, four])[0].record["id"] == "7件"
+    assert match_line(line4, [seven, four])[0].record["id"] == "4件"
+
+
+def test_heart_model_scale_discrimination():
+    """心脏解剖模型 3倍自然大(50) vs 自然大(40) 必须区分。"""
+    triple = _saitel_record("三倍", "心脏解剖模型", "3倍自然大", "件", 50, "33207", "初中生物")
+    natural = _saitel_record("自然大", "心脏解剖模型", "自然大", "件", 40, "33208", "初中生物")
+    line_natural = _plain_line("心脏解剖模型", "自然大，PVC制，从心尖部至主动脉根部长 85mm", "件")
+    line_triple = _plain_line("心脏解剖模型", "1.规格：3 倍自然大；2.沿左右心耳上方剖开", "件")
+    assert match_line(line_natural, [triple, natural])[0].record["id"] == "自然大"
+    assert match_line(line_triple, [triple, natural])[0].record["id"] == "三倍"
+
+
+def test_flask_bottom_shape_discrimination():
+    """烧瓶 圆底/平底 是不同规格，圆底询价不得选平底记录。"""
+    flat = _saitel_record("平底", "烧瓶", "平、长，250ml", "个", 9, "61037", "初中物理")
+    round_b = _saitel_record("圆底", "烧瓶", "圆、长，250mL", "个", 9, "61033", "初中化学")
+    line = _plain_line("烧瓶", "3.3 硼硅玻璃，细口圆底烧瓶，标称容量 250ml，全高 145mm", "个")
+    assert match_line(line, [flat, round_b])[0].record["id"] == "圆底"
+
+
+def test_grouped_molecular_model_prefers_group_variant():
+    """32003 分子结构模型：学生分组用应选分组用(40)，而不是演示用(140)/初中用(55)。"""
+    demo = _saitel_record("演示", "分子结构模型", "演示用", "套", 140, "32003", "高中化学")
+    grouped = _saitel_record("分组", "分子结构模型", "分组用", "套", 40, "32003", "高中化学")
+    junior = _saitel_record("初中", "分子结构模型", "初中用", "套", 55, "32003", "初中化学")
+    line = _plain_line(
+        "分子结构模型",
+        "初中分组学生用，可组合初中分子结构模型：氢气、氧气、水分子、二氧化碳分子、甲烷等",
+        "套", "32003",
+    )
+    assert match_line(line, [demo, grouped, junior])[0].record["id"] == "分组"
+
+
+def test_extreme_price_outlier_same_name_is_demoted():
+    """玻璃棒：同规格记录多数为 12 元，1.3 元异常低价不得当选。"""
+    records = [
+        _saitel_record("cheap", "玻璃棒", "φ5mm～φ6mm", "个", 1.3, "64054", "小学科学"),
+        _saitel_record("kg1", "玻璃棒", "φ5～φ6mm", "千克", 12.0, "64054", "初中化学"),
+        _saitel_record("kg2", "玻璃棒", "φ5mm～φ6mm", "千克", 12.0, "64053", "高中化学"),
+        _saitel_record("kg3", "玻璃棒", "φ5mm～6mm", "千克", 12.0, "64053", "高中生物"),
+        _saitel_record("kg4", "玻璃棒", "Φ 5 mm ～6 mm 粗细均匀", "kg", 12.0, "30605005302", "初中新课标化学"),
+        _saitel_record("root", "玻璃棒", "Φ5mm~Φ6mm，两端烧结", "根", 2.0, "30605005302", "小学新课标科学"),
+    ]
+    line = _plain_line("玻璃棒", "1、规格：φ5～φ6mm 2、高硼硅 3、长≥300mm，两端做烧结处理", "个")
+    candidates = match_line(line, records)
+    assert candidates[0].record["id"] != "cheap"
+    assert candidates[0].record["price"] == 12.0
+
+
+def test_config_price_delta_pulley_stop_rule():
+    """21032 滑轮组含可止动配置：老课标基础价 9 元 + 6 元 = 15 元。"""
+    from app.services import config_price_delta
+    delta, note = config_price_delta(
+        {"name": "滑轮组", "spec": "1.学生用；2.每个滑轮组中应至少有一个可止动滑轮"},
+        {"product_code": "21032", "name": "滑轮组", "price": 9.0},
+    )
+    assert delta == 6.0
+    assert "止动" in note
+    delta_plain, _ = config_price_delta(
+        {"name": "滑轮组", "spec": "由双滑轮2只（串），单滑轮2只组成"},
+        {"product_code": "21032", "name": "滑轮组", "price": 9.0},
+    )
+    assert delta_plain == 0.0
+
+
+def test_inquiry_typo_centrifuge_stand_matches():
+    """询价错字"手摇离心钻台"应归一为"手摇离心转台"。"""
+    assert name_core("手摇离心钻台") == name_core("手摇离心转台")

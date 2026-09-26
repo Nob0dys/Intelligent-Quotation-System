@@ -74,6 +74,17 @@ def normalize_text(value: object) -> str:
     )
 
 
+@lru_cache(maxsize=65536)
+def normalize_code(value: object) -> str:
+    """Product-code key that also drops the accidental ".0" suffix stored by
+    price-book exports (30307216301.0 → 30307216301).  Strip it *before*
+    normalize_text because punctuation removal would glue the dot onto digits."""
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if raw.endswith(".0") and raw[:-2].isdigit():
+        raw = raw[:-2]
+    return normalize_text(raw)
+
+
 NAME_PREFIX_RE = re.compile(r"^(高中物理|高中生物|高中化学|初中物理|初中生物|初中化学)")
 
 GRADE_MARKER_RE = re.compile(r"^(高中|初中|小学)")
@@ -105,6 +116,12 @@ def name_core(value: object) -> str:
             if stripped == text:
                 break
             text = stripped
+    # 价目本导出脏后缀：单个尾字母（光的传播、反射、折射实验器c / LED光源a）。
+    # 术语归一：磁体↔磁铁 视为同一词（蹄形磁体 = 蹄形磁铁）。
+    # 询价清单常见错字：手摇离心钻台 → 手摇离心转台。
+    text = text.replace("磁铁", "磁体")
+    text = text.replace("离心钻台", "离心转台")
+    text = re.sub(r"(?<=[\u4e00-\u9fff])[a-z]$", "", text)
     if len(text) >= 2:
         text = TRAIL_VARIANT_RE.sub("", text)
     return text or normalize_text(value)
@@ -166,17 +183,14 @@ def parameter_similarity(left: str, right: str) -> float:
             has_ranges = True
             overlap = max(0, min(lr[1], rr[1]) - max(lr[0], rr[0]))
             total = max(lr[1], rr[1]) - min(lr[0], rr[0])
-            if total == 0:
-                # 退化区间 (v,v) 对 (v,v)：单值相等视为完全一致
-                range_bonus = max(range_bonus, 0.3)
-                continue
-            iou = overlap / total
-            if iou > 0.8:
-                range_bonus = max(range_bonus, 0.3)
-            elif iou > 0.5:
-                range_bonus = max(range_bonus, 0.15)
-            elif iou < 0.2:
-                range_bonus = min(range_bonus, -0.2)
+            if total > 0:
+                iou = overlap / total
+                if iou > 0.8:
+                    range_bonus = max(range_bonus, 0.3)
+                elif iou > 0.5:
+                    range_bonus = max(range_bonus, 0.15)
+                elif iou < 0.2:
+                    range_bonus = min(range_bonus, -0.2)
 
     # 短 spec 是弱信号：4-6 字的"永磁、电磁场"类描述不应与长文本高相似，
     # 避免让"部分同名但规格巧合重叠"的候选压过真正同名的候选。
@@ -427,8 +441,7 @@ CAP_PATTERN = re.compile(
 )
 
 # P0: 规格范围提取模式
-# 匹配 "Φ7～8mm" "φ7mm～8mm" "7-8mm" "7~8mm" "7—8mm" "7－8mm" 等范围格式；
-# 第二个数字允许带 φ/Φ 前缀（"Φ3mm~Φ4mm" 应解析为 (3,4) 而非单值 (3,3)+(4,4)）
+# 匹配 "Φ7～8mm" "φ7mm～8mm" "φ5～φ6mm" "7-8mm" "7~8mm" "7—8mm" "7－8mm" 等范围格式
 RANGE_PATTERN = re.compile(
     r"[Φφ]?\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ml|l|g|kg|mg|℃|°c|v|a|w|hz|pa|kpa|mpa|%)?\s*"
     r"[～~—－-]\s*[Φφ]?\s*(\d+(?:\.\d+)?)\s*"
@@ -532,7 +545,43 @@ def spec_ranges(text: str) -> dict:
 
     return ranges
 
-# 修饰词变体表（理化生教学仪器常见“同根词不同产品”），写正则而非字面集合：
+
+@lru_cache(maxsize=262144)
+def spec_values(text: str) -> dict:
+    """按单位收集文本中出现的全部单值（含范围两端），用于"任一值命中"比较。
+
+    例："支杆直径 10 mm，全长 140 mm" → {"mm": [10.0, 140.0]}
+    修复"单值比较只取第一个数"导致的假告警（140mm 询价 vs 候选 10mm 误报）。
+    """
+    values: dict[str, list[float]] = {}
+    if not text:
+        return values
+    nt = unicodedata.normalize("NFKC", text).lower()
+    for m in CAP_PATTERN.finditer(nt):
+        value = float(m.group(1))
+        unit = UNIT_MAP.get(m.group(2), m.group(2))
+        if not unit:
+            continue
+        values.setdefault(unit, []).append(value)
+    for m in RANGE_PATTERN.finditer(nt):
+        unit = UNIT_MAP.get(m.group(3) or "", m.group(3) or "")
+        if not unit:
+            continue
+        values.setdefault(unit, []).extend([float(m.group(1)), float(m.group(2))])
+    return values
+
+
+def _values_overlap(line_values: list[float], record_values: list[float], tolerance: float = 0.3) -> bool:
+    """询价任一数值在候选任一数值的 tolerance 相对误差内即视为吻合。"""
+    for lv in line_values:
+        if lv <= 0:
+            continue
+        for rv in record_values:
+            if abs(rv - lv) / lv <= tolerance:
+                return True
+    return False
+
+
 # line/record 去掉这些修饰词后相同 → 视为不同产品，给 12 分罚。
 MODIFIER_PENALTY_PAT = re.compile(
     r"(演示|实验|图形|内能|新型|高中|初中|小学|学生用|教师用|教学用|数显|指针|液晶|"
@@ -540,6 +589,15 @@ MODIFIER_PENALTY_PAT = re.compile(
     r"不锈钢|铜质|铁质|塑料|玻璃|木质|单面|双面|电磁式|永磁式|"
     r"数字式|模拟式|普通型|高精度)"
 )
+
+# 件数（7件/4件）、倍率（3倍自然大/自然大）、配置词（支杆滑轮/可止动）、
+# 瓶口形状（圆底/平底）——教学仪器同品名常见"多配置不同价"维度。
+COUNT_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*件")
+SCALE_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*倍")
+ROUND_BOTTOM_PAT = re.compile(r"圆底|圆长|圆、长|圆形底")
+FLAT_BOTTOM_PAT = re.compile(r"平底|平长|平、长|扁平底")
+BRANCH_PAT = re.compile(r"支杆")
+STOP_PAT = re.compile(r"止动|可卡")
 
 
 @lru_cache(maxsize=262144)
@@ -561,19 +619,22 @@ def _spec_features(text: object) -> dict:
         # 教学用=大规格高价档。询价与候选定位冲突时罚分。
         # 注意："教学用磁钢极性标注"是标准表述（含"教学用"但非定位词），
         # 用 学生用/教师用/演示用 等明确定位词判断，避免误触发。
-        # "分组用"（学生分组实验用）归入学生定位：分子结构模型 分组用40元
-        # 应与 演示用140元 区分。
-        "student": bool(re.search(r"学生用|学生型|分组用", nt)),
+        "student": bool(re.search(r"学生用|学生型", nt)),
         "teaching": bool(re.search(r"教师用|演示用|教学用(?!磁钢)", nt)),
+        # 学生分组/分组用：与演示用（大球大规格）互为不同定位
+        "grouped": bool(re.search(r"分组用|学生分组|分组学生|分组实验", nt)),
+        "count": None,
+        "scale": None,
+        "round_bottom": bool(ROUND_BOTTOM_PAT.search(nt)),
+        "flat_bottom": bool(FLAT_BOTTOM_PAT.search(nt)),
+        "branch": bool(BRANCH_PAT.search(nt)),
+        "stop": bool(STOP_PAT.search(nt)),
         # P1: 形状关键词
         "shape": "",
         # P1: 材质关键词
         "material": "",
         # P1: 放大倍数
         "magnification": "",
-        # P1: 套件件数（"7件"/"4件套"）：解剖器 7件 vs 4件 等套件规格的区分维度。
-        # 只支持阿拉伯数字——"二件支杆滑轮" 等中文数词不提取，避免误判。
-        "pcs": None,
     }
 
     # P1: 形状提取
@@ -618,11 +679,6 @@ def _spec_features(text: object) -> dict:
         else:
             features["magnification"] = f"{mag_match.group(1)}×"
 
-    # P1: 套件件数提取（"7件"/"4件套"）
-    pcs_match = re.search(r"(\d+(?:\.\d+)?)\s*件\s*套?", nt)
-    if pcs_match:
-        features["pcs"] = float(pcs_match.group(1))
-
     for amount_text, unit_text in CAP_PATTERN.findall(nt):
         value = float(amount_text)
         unit = normalize_text(unit_text)
@@ -644,6 +700,17 @@ def _spec_features(text: object) -> dict:
             continue
         if unit not in features["caps"] or value > features["caps"][unit]:
             features["caps"][unit] = value
+
+    count_match = COUNT_PATTERN.search(nt)
+    if count_match:
+        features["count"] = float(count_match.group(1))
+    scale_match = SCALE_PATTERN.search(nt)
+    if scale_match:
+        features["scale"] = float(scale_match.group(1))
+    elif re.search(r"自然大|原大|实物大", nt):
+        # 心脏解剖模型类：文字写"自然大"但标注 ≥200mm 总长时，实际是放大版
+        # （33207 三倍自然大 50 元 vs 33208 自然大 40 元）。
+        features["scale"] = 3.0 if (features["caps"].get("mm") or 0) >= 200 else 1.0
     return features
 
 
@@ -666,13 +733,8 @@ def numeric_spec_bonus(line: dict, record: dict) -> float:
         if lr and rr:
             overlap = max(0, min(lr[1], rr[1]) - max(lr[0], rr[0]))
             total = max(lr[1], rr[1]) - min(lr[0], rr[0])
-            if total == 0:
-                # 退化区间 (v,v) 对 (v,v)：单值相等视为完全一致
+            if total <= 0 or overlap / total > 0.8:
                 bonus += 2.0
-            else:
-                iou = overlap / total
-                if iou > 0.8:
-                    bonus += 2.0
 
     # 单值比较
     for unit in ("g", "ml", "a", "v", "w", "mm"):
@@ -680,9 +742,6 @@ def numeric_spec_bonus(line: dict, record: dict) -> float:
         record_value = record_feat["caps"].get(unit)
         if line_value and record_value and abs(record_value - line_value) / line_value <= 0.02:
             bonus += 2.0
-    # 套件件数一致加分（解剖器 7件 vs 7件）
-    if line_feat["pcs"] and record_feat["pcs"] and line_feat["pcs"] == record_feat["pcs"]:
-        bonus += 2.0
     return min(bonus, 6.0)
 
 
@@ -714,10 +773,15 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
     line_ranges = spec_ranges(line_text)
     record_ranges = spec_ranges(record_text)
 
-    # P5: 三维尺寸有序比较（优先于范围比较）
+    # P5: 三维尺寸有序比较（优先于范围比较）。
+    # 尺寸比较一旦执行，mm 级（量程/单值/倍数）不再重复罚分——否则同一组数字被
+    # dims+range+single+magnification 四重叠加（220×320mm vs 95×80×6.5mm 罚 32 分，
+    # 把正确的电场线演示器 45 元条目打到 16.3 分跌出默认池）。
+    dims_checked = False
     line_dims = line_ranges.get("dims")
     record_dims = record_ranges.get("dims")
     if line_dims and record_dims:
+        dims_checked = True
         if len(line_dims) == len(record_dims):
             # 逐维比较，允许一定误差（15%）
             max_rel_diff = 0.0
@@ -739,54 +803,41 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
                 f"候选{'×'.join(f'{v:g}' for v in record_dims)}mm"
             )
 
+    line_values = spec_values(line_text)
+    record_values = spec_values(record_text)
+
     for unit in ("mm", "ml", "g", "a", "v", "w", "℃"):
+        if unit == "mm" and dims_checked:
+            continue
         line_range = line_ranges.get(unit)
         record_range = record_ranges.get(unit)
+        if not line_range and not record_range:
+            continue
         if line_range and record_range:
-            # 范围重叠度检查：如果两个范围有显著重叠（>80%），视为相同
+            # 范围重叠度检查：完全同值（total<=0）或重叠 >80% 视为相同；否则罚分。
             overlap = max(0, min(line_range[1], record_range[1]) - max(line_range[0], record_range[0]))
             total = max(line_range[1], record_range[1]) - min(line_range[0], record_range[0])
-            if total == 0:
-                # 退化区间 (v,v) 对 (v,v)：单值相等不罚
-                # （修复 "询价500~500ml vs 候选500~500ml" 的假量程警告）
+            if total <= 0 or overlap / total > 0.8:
+                continue  # 范围一致/重叠，不罚分
+            # 范围表述不同但数值集合吻合（如询价"5~6mm"候选"φ5mm、φ6mm"）不再罚。
+            if _values_overlap(line_values.get(unit, []), record_values.get(unit, [])):
                 continue
-            if overlap / total > 0.8:
-                continue  # 范围重叠，不罚分
-            # 范围不重叠，罚分
             penalty += 8
             warnings.append(
                 f"规格量程不符：询价{line_range[0]:g}~{line_range[1]:g}{unit}，"
                 f"候选{record_range[0]:g}~{record_range[1]:g}{unit}"
             )
-        elif line_range and not record_range:
-            # 询价有范围，候选只有单值
-            line_value = line_feat["caps"].get(unit)
-            record_value = record_feat["caps"].get(unit)
-            if line_value and record_value and abs(record_value - line_value) / line_value > 0.3:
+        else:
+            # 一侧范围一侧单值：按"任一数值命中"比较（修复 140mm vs 支杆10mm 假告警）
+            lv = line_values.get(unit) or ([line_range[0], line_range[1]] if line_range else [])
+            rv = record_values.get(unit) or ([record_range[0], record_range[1]] if record_range else [])
+            if lv and rv and not _values_overlap(lv, rv):
                 penalty += 8
-                warnings.append(f"规格量程不符：询价{line_value:g}{unit}，候选{record_value:g}{unit}")
-        elif not line_range and record_range:
-            # 询价只有单值，候选有范围
-            line_value = line_feat["caps"].get(unit)
-            record_value = record_feat["caps"].get(unit)
-            if line_value and record_value and abs(record_value - line_value) / line_value > 0.3:
-                penalty += 8
-                warnings.append(f"规格量程不符：询价{line_value:g}{unit}，候选{record_value:g}{unit}")
+                warnings.append(
+                    f"规格量程不符：询价{lv[0]:g}{unit}，候选{rv[0]:g}{unit}"
+                )
 
-    # 单值比较（无范围时回退到原有逻辑）
-    # P5: 如果 dims 已匹配，跳过单值比较（避免 CAP_PATTERN 提取差异导致误判）
-    dims_matched = (
-        line_dims and record_dims
-        and len(line_dims) == len(record_dims)
-        and all(abs(a - b) / max(a, 1e-9) <= 0.15 for a, b in zip(line_dims, record_dims))
-    )
-    if not dims_matched:
-        for unit in ("g", "ml", "a", "v", "w", "mm"):
-            line_value = line_feat["caps"].get(unit)
-            record_value = record_feat["caps"].get(unit)
-            if line_value and record_value and abs(record_value - line_value) / line_value > 0.3:
-                penalty += 8
-                warnings.append(f"规格量程不符：询价{line_value:g}{unit}，候选{record_value:g}{unit}")
+    # 单值比较已并入上方"任一数值命中"逻辑（spec_values），此处不再重复罚分。
 
     if line_feat["mf"] and record_feat["mf"] and set(line_feat["mf"]) != set(record_feat["mf"]):
         penalty += 8
@@ -808,6 +859,61 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
     if line_feat["teaching"] and record_feat["student"]:
         penalty += 8
         warnings.append("规格定位不符：询价教学用，候选为学生用")
+    # 学生分组用 ↔ 演示用：分子结构模型等"同品名不同定位不同价"
+    # （演示用 140 元 vs 分组用 40 元），定位冲突时必须区分。
+    if line_feat["grouped"] and record_feat["teaching"]:
+        penalty += 8
+        warnings.append("规格定位不符：询价学生分组用，候选为演示/教学用")
+    if line_feat["teaching"] and record_feat["grouped"]:
+        penalty += 8
+        warnings.append("规格定位不符：询价演示/教学用，候选为学生分组用")
+    if line_feat["grouped"] and not record_feat["grouped"] and not record_feat["teaching"]:
+        penalty += 4
+        warnings.append("规格定位差异：询价学生分组用，候选未注明分组（演示/分组价差可达3倍）")
+
+    # 件数（解剖器 7件 vs 4件）：两边都给出"N件"时不一致罚 8 分。
+    if (
+        line_feat["count"] is not None
+        and record_feat["count"] is not None
+        and abs(line_feat["count"] - record_feat["count"]) > 0.01
+    ):
+        penalty += 8
+        warnings.append(
+            f"规格件数不符：询价{line_feat['count']:g}件，候选{record_feat['count']:g}件"
+        )
+
+    # 倍率（心脏解剖模型 3倍自然大 vs 自然大）：两边都给倍率且不一致罚 8 分；
+    # 询价未注明而候选带倍率（≥2倍）罚 6 分——避免默认拿放大版顶替。
+    if (
+        line_feat["scale"] is not None
+        and record_feat["scale"] is not None
+        and abs(line_feat["scale"] - record_feat["scale"]) > 0.01
+    ):
+        penalty += 8
+        warnings.append(
+            f"规格倍率不符：询价{line_feat['scale']:g}倍，候选{record_feat['scale']:g}倍"
+        )
+    elif line_feat["scale"] is None and record_feat["scale"] not in (None, 1.0):
+        penalty += 6
+        warnings.append(f"规格倍率差异：询价未注明，候选{record_feat['scale']:g}倍")
+
+    # 瓶底形状（烧瓶 圆底 vs 平底）：两边都有标记且不一致罚 8 分。
+    if line_feat["round_bottom"] and record_feat["flat_bottom"]:
+        penalty += 8
+        warnings.append("规格形状不符：询价圆底/圆长，候选平底/平长")
+    if line_feat["flat_bottom"] and record_feat["round_bottom"]:
+        penalty += 8
+        warnings.append("规格形状不符：询价平底/平长，候选圆底/圆长")
+
+    # 支杆滑轮（演示滑轮组/滑轮组 含支杆版本 40 元 vs 无支杆 18/9 元）：
+    # 询价明确"支杆"而候选无 → 罚分；询价未注明而候选含支杆只作差异提示。
+    if line_feat["branch"] and not record_feat["branch"]:
+        penalty += 8
+        warnings.append("规格配置不符：询价含支杆滑轮，候选未含支杆")
+    # 可卡/止动滑轮：老价目本记录未注明时按配置加价规则处理（21032 +6 元），
+    # 只提示差异、不罚分，避免把基础记录换成本不需要的配置版。
+    if line_feat["stop"] and not record_feat["stop"]:
+        warnings.append("规格配置差异：询价含可卡/止动滑轮，候选未注明（按配置加价核对）")
 
     # P2: 形状不符罚分（U型 vs 单球、方形 vs 圆形）
     if line_feat["shape"] and record_feat["shape"] and line_feat["shape"] != record_feat["shape"]:
@@ -820,17 +926,14 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
         penalty += 4
         warnings.append(f"规格材质不符：询价{line_feat['material']}，候选{record_feat['material']}")
 
-    # P2: 放大倍数不符罚分（200× vs 500×）
-    if line_feat["magnification"] and record_feat["magnification"] and line_feat["magnification"] != record_feat["magnification"]:
+    # P2: 放大倍数不符罚分（200× vs 500×）；尺寸串（220×320mm）不算倍数
+    if (
+        not dims_checked
+        and line_feat["magnification"] and record_feat["magnification"]
+        and line_feat["magnification"] != record_feat["magnification"]
+    ):
         penalty += 8
         warnings.append(f"规格倍数不符：询价{line_feat['magnification']}，候选{record_feat['magnification']}")
-
-    # P1: 套件件数不符罚分（解剖器 7件 vs 4件）——双方都提取到件数且不等才罚
-    if line_feat["pcs"] and record_feat["pcs"] and line_feat["pcs"] != record_feat["pcs"]:
-        penalty += 8
-        warnings.append(
-            f"规格件数不符：询价{line_feat['pcs']:g}件，候选{record_feat['pcs']:g}件"
-        )
 
     # 修饰词变体罚：把修饰词从两个名字都剥掉后核心相同、但修饰词集合不同，
     # 视为不同产品（演示斜面小车≠斜面小车、数显电流表≠指针电流表）。
@@ -901,9 +1004,9 @@ def requirement_warnings(record: dict, requirements: list[dict]) -> list[str]:
 def score_record(line: dict, record: dict, requirements: list[dict] | None = None) -> Candidate:
     requirements = requirements or []
     exact_code = bool(
-        normalize_text(line.get("product_code"))
-        and normalize_text(line.get("product_code"))
-        == normalize_text(record.get("product_code"))
+        normalize_code(line.get("product_code"))
+        and normalize_code(line.get("product_code"))
+        == normalize_code(record.get("product_code"))
     )
     # 名称完全一致（含 演示器↔实验器 等价归一）：同名候选给决定性加分，
     # 防止"部分同名但长规格文本巧合重叠"的候选压过真正同名同产品的候选
@@ -946,11 +1049,8 @@ def score_record(line: dict, record: dict, requirements: list[dict] | None = Non
         # 精确同名产品压到选不中（如 摩擦力演示器 同名候选只有30分被判unmatched）。
         # 但候选自身无 spec 时不保底——无规格信息的记录无法证明量程吻合，
         # 保底会让 直尺5.0(无spec) 压过 直尺6.0(演示用1m塑料米尺)。
-        # exact_code 候选不保底：其得分固定 100 基础分、不依赖分项，
-        # 保底只会抹平同码不同规格在排序键上的参数差异（分子结构模型
-        # 演示用/分组用/初中用 参数分量全被压成 16）。
         "参数": round(
-            (spec_similarity if exact_code or not (name_exact and record.get("spec")) else max(spec_similarity, 0.4)) * 40,
+            (spec_similarity if not (name_exact and record.get("spec")) else max(spec_similarity, 0.4)) * 40,
             2,
         ),
         "型号": round(model_similarity * 13, 2),
@@ -979,6 +1079,10 @@ def score_record(line: dict, record: dict, requirements: list[dict] | None = Non
     if line_feat_loc["teaching"] and record_feat_loc["teaching"]:
         score += 3.0
         reasons.append("教学用定位一致")
+    # 学生分组定位一致加分：初中分组学生用 应匹配 分组用（而不是演示用 140）。
+    if line_feat_loc["grouped"] and record_feat_loc["grouped"]:
+        score += 3.0
+        reasons.append("学生分组定位一致")
     if name_similarity == 1:
         reasons.append("名称一致")
     elif name_similarity >= 0.6:
@@ -1000,13 +1104,17 @@ def score_record(line: dict, record: dict, requirements: list[dict] | None = Non
         warnings.append(f"BLOCK: {category_reason}")
     warnings.extend(requirement_warnings(record, requirements))
     penalty, variant_warnings = variant_penalty(line, record)
-    if not category_ok and not exact_code:
+    if not category_ok:
         penalty += 20  # 类目不符额外重罚（区别于规格变体）
     warnings.extend(variant_warnings)
     numeric_bonus = numeric_spec_bonus(line, record)
-    # exact_code 保持 100 基础分与候选锁池，但规格变体罚分与数值加分照常执行：
-    # 同码不同规格的记录由此拉开分差（注射器 10/50/100mL 不再被压成同分同价）。
-    score = round(max(0.0, score - penalty) + numeric_bonus, 2)
+    if exact_code:
+        # 精确同码也必须执行规格罚分/加分：同码多规格（02102 5/50/100mL、
+        # 27001/27002、33207/33208、32003 演示/分组）否则全部并列为 100 分，
+        # 变体选择退化为排序碰运气。
+        score = round(max(0.0, 100.0 - penalty) + numeric_bonus, 2)
+    else:
+        score = round(max(0.0, score - penalty) + numeric_bonus, 2)
     if numeric_bonus >= 4:
         reasons.append("规格数值吻合")
     confidence = confidence_for(score, warnings)
@@ -1029,7 +1137,7 @@ def match_line(
     limit: int = 30,
 ) -> list[Candidate]:
     normalized_name = name_core(line.get("name", ""))
-    normalized_code = normalize_text(line.get("product_code", ""))
+    normalized_code = normalize_code(line.get("product_code", ""))
     # 候选池：先用类目硬过滤大幅缩小范围（类目判不出的仍保留）
     category_pool = same_category_pool(line, records)
     if len(category_pool) < 8:  # 类目过滤太狠导致候选不足时退回全库
@@ -1038,7 +1146,7 @@ def match_line(
         record
         for record in category_pool
         if normalized_code
-        and normalize_text(record.get("product_code", "")) == normalized_code
+        and normalize_code(record.get("product_code", "")) == normalized_code
     ]
     exact_name_records = [
         record for record in category_pool if name_core(record.get("name", "")) == normalized_name
@@ -1075,6 +1183,19 @@ def match_line(
         )
         if code_compatible or not exact_name_records:
             pool = exact_code_records
+            # 新配备标准 sheet（课标编号命中的记录）只用于识别与参数对照：
+            # 同码或全无价时并入同名/高分候选，让老价目本记录仍能参与报价
+            # （龙岩 斜面小车 编号命中初中新课标 60 元，正确答案是老 高中物理 46 元）。
+            new_standard_only = all(
+                "新课标" in str(record.get("source_sheet") or "")
+                for record in exact_code_records
+            )
+            if new_standard_only or not any(record.get("price") for record in pool):
+                seen_ids = {record.get("id") for record in pool}
+                for record in exact_name_records + scored_pool:
+                    if record.get("id") not in seen_ids:
+                        pool.append(record)
+                        seen_ids.add(record.get("id"))
         else:
             pool = list(exact_code_records)
             seen_ids = {record.get("id") for record in pool}
@@ -1097,43 +1218,89 @@ def match_line(
     # 会被 4.5元 500mm直尺 拉出 >2x 判 0 分，永远排不上）。
     line_core = normalized_name
     line_feat = _spec_features(f"{line.get('name', '')} {line.get('spec', '')}")
+    line_values = spec_values(f"{line.get('name', '')} {line.get('spec', '')}")
 
     def _same_range(record: dict) -> bool:
-        record_feat = _spec_features(f"{record.get('name', '')} {record.get('spec', '')}")
+        record_vals = spec_values(f"{record.get('name', '')} {record.get('spec', '')}")
         for unit in ("mm", "ml", "g", "a", "v", "w"):
-            lv = line_feat["caps"].get(unit)
-            rv = record_feat["caps"].get(unit)
-            if lv and rv and (rv / lv > 1.5 or rv / lv < 1 / 1.5):
+            lv = line_values.get(unit)
+            rv = record_vals.get(unit)
+            if lv and rv and not _values_overlap(lv, rv, 0.6):
                 return False
         return True
 
     peer_prices = []
-    for item in candidates:
-        price_val = float(item.record.get("price", 0))
+    # 统计同核心词组价格基准时使用全量历史记录（不只候选池/精确同码小池）——
+    # 64054 玻璃棒精确同码只有 1.3/12 两条，必须并入全库所有同规格记录，
+    # 才能识别 1.3 是异常低价（同规格 12 元×5）。
+    for record in records:
+        price_val = float(record.get("price", 0))
         if (
             price_val
-            and bigram_dice(line_core, name_core(item.record.get("name", ""))) >= 0.3
-            and _same_range(item.record)
+            and bigram_dice(line_core, name_core(record.get("name", ""))) >= 0.3
+            and _same_range(record)
         ):
             peer_prices.append(price_val)
     if len(peer_prices) >= 3:
-        sorted_prices = sorted(peer_prices)
-        truncated = sorted_prices[: max(3, (len(sorted_prices) * 3) // 4)]
-        peer_median = median(truncated) if truncated else 0.0
+        # 以"主导价位簇"为基准（价目本同一产品多数记录价格一致），而不是被
+        # 个别错价（1.3/2 元）拉偏的普通中位数——玻璃棒 12 元×5 vs 1.3/2 元×2。
+        def _bucket(value: float) -> float:
+            if value <= 0:
+                return 0.0
+            digits = len(str(int(abs(value)))) - 1
+            step = max(10.0 ** (digits - 1), 0.01)
+            return round(value / step) * step
+
+        clusters: dict[float, list[float]] = {}
+        for price_val in peer_prices:
+            clusters.setdefault(_bucket(price_val), []).append(price_val)
+        dominant = max(clusters.values(), key=len)
+        if len(dominant) >= 2:
+            peer_median = median(dominant)
+        else:
+            sorted_prices = sorted(peer_prices)
+            truncated = sorted_prices[: max(3, (len(sorted_prices) * 3) // 4)]
+            peer_median = median(truncated) if truncated else 0.0
     else:
         peer_median = 0.0
 
     for item in candidates:
         price_val = float(item.record.get("price", 0))
         component = 6.0
+        # 同名多规格（电阻箱四位/六位、滑动变阻器 20Ω/50Ω…）的价差是版本差异，
+        # 不是离群错误——用中位价惩罚会把正确的高配版压给低配版，故同名候选不罚。
+        # 例外：极端离群（<0.25x / >4x）且候选无与询价一致的区分词（材质/件数/
+        # 倍率/学生分组/支杆等）——玻璃棒 1.3 元/个 vs 同规格 12 元/千克，
+        # 多数记录一致为 12，1.3 属异常低价。
+        same_name_candidate = name_core(item.record.get("name", "")) == line_core
+        item_feat = _spec_features(
+            f"{item.record.get('name', '')} {item.record.get('spec', '')}"
+        )
+        variant_token_match = bool(
+            (line_feat["student"] and item_feat["student"])
+            or (line_feat["teaching"] and item_feat["teaching"])
+            or (line_feat["grouped"] and item_feat["grouped"])
+            or (line_feat["branch"] and item_feat["branch"])
+            or (
+                line_feat["count"] is not None
+                and item_feat["count"] is not None
+                and abs(line_feat["count"] - item_feat["count"]) <= 0.01
+            )
+        )
         if peer_median and price_val:
             ratio = price_val / peer_median
-            if ratio > 2.0 or ratio < 0.5:
-                component = 0.0
-            elif ratio > 1.5 or ratio < 0.67:
-                component = 2.0
-            elif ratio > 1.25 or ratio < 0.8:
-                component = 4.0
+            if same_name_candidate:
+                if not variant_token_match and (ratio > 4.0 or ratio < 0.25):
+                    component = 0.0
+                    item.score = round(item.score - 8.0, 2)
+                    item.warnings.append("价格异常：显著偏离同规格记录中位价，需人工核对")
+            else:
+                if ratio > 2.0 or ratio < 0.5:
+                    component = 0.0
+                elif ratio > 1.5 or ratio < 0.67:
+                    component = 2.0
+                elif ratio > 1.25 or ratio < 0.8:
+                    component = 4.0
         # score_record 打分时分项"价格一致性"=0 且 penalty 已扣；
         # 这里把回写后的价格一致性分项直接加上即可。
         item.component_scores["价格一致性"] = component

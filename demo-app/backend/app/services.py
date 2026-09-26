@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import time
@@ -21,8 +20,11 @@ from .matching import (
     grade_marker,
     match_line,
     name_core,
+    normalize_code,
     normalize_text,
+    spec_values,
     _spec_features,
+    _values_overlap,
     warmup_match_caches,
 )
 from .category import category_compatible, infer_category_from_name
@@ -40,6 +42,9 @@ from .models import (
 from .security import hash_password
 
 
+# 候选可选下限：低于该分数不默认带出任何方案，也不视为“有匹配”。
+# 低于 55(RELIABLE_THRESHOLD) 但仍 >=本值的候选按低置信复核展示。
+OPTION_FLOOR = 40.0
 # 非赛特尔来源的默认选中下限（一键导出覆盖率优先，30-40 分行自动带价但标低置信）。
 AUTOSELECT_FLOOR = 30.0
 # 赛特尔价目本为规则指定优先来源（“有赛特尔选赛特尔”），其候选下限放宽到 20 分。
@@ -61,17 +66,6 @@ MODE_TERMS_RE = re.compile(
 # 赛特尔优先：仅“赛特尔25年.xls”价目本为最高优先级来源（有赛特尔25年记录时
 # 优先默认选中）；其余所有文件（普教/包1-4/标准答案等）优先级相同。
 SAITEL_MARK = "赛特尔25年"
-# 变体守卫：带这些警告前缀的候选不进入默认选中池（规格/定位/形状/材质等
-# 错配不自动带价；BLOCK 类硬警告同理）。
-VARIANT_GUARD_PREFIXES = (
-    "规格变体", "规格量程", "规格尺寸", "规格定位", "规格形状",
-    "规格材质", "规格倍数", "修饰词变体", "BLOCK:",
-)
-# 每个报价任务"需人工复核"行数的目标上限（百分比）：hard-manual 行
-# （无候选/无默认选中/BLOCK/VIP毛利核对）不占用该额度、如实保留；
-# 其余行按"severe 警告优先、低分优先"降级进复核，直到达到目标比例。
-# 0 = 除 hard-manual 外全部自动通过。
-REVIEW_TARGET_PERCENT = float(os.getenv("QUOTE_REVIEW_TARGET_PERCENT", "10"))
 
 
 def mode_conflict(line_core: str, record_core: str) -> bool:
@@ -96,19 +90,6 @@ def mode_conflict(line_core: str, record_core: str) -> bool:
 
 def is_saitel(source_file: object) -> bool:
     return SAITEL_MARK in str(source_file or "")
-
-
-def is_customer_exclusive(record: dict) -> bool:
-    """客户专属报价单行（HistoryQuote.customer_id 非空）。"""
-    return record.get("customer_id") is not None
-
-
-def _autoselect_floor(record: dict) -> float:
-    """默认选中/入选下限：赛特尔价目本与客户专属价目按受信来源放宽到
-    SAITEL_FLOOR，其余公共来源用 AUTOSELECT_FLOOR。"""
-    if is_saitel(record.get("source_file")) or is_customer_exclusive(record):
-        return SAITEL_FLOOR
-    return AUTOSELECT_FLOOR
 
 
 def robust_median(prices: list[float]) -> float:
@@ -418,12 +399,70 @@ def _history_dict(record: HistoryQuote) -> dict:
         "quote_date": record.quote_date,
         "source_priority": record.source_priority,
         "data_quality": record.data_quality,
-        "customer_id": record.customer_id,
+    }
+
+
+# 配置加价规则：老编号体系的基础记录不含某配置时的补差价（用户确认的行业规则）。
+# 21032 滑轮组：带"可止动"配置时 9 元基础价 + 6 元/套 = 15 元（老课标优先）。
+CONFIG_PRICE_RULES: tuple[dict, ...] = (
+    {
+        "record_code": "21032",
+        "keywords": ("止动", "可止动", "可卡"),
+        "delta": 6.0,
+        "note": "含可止动滑轮，+6元/套",
+    },
+)
+
+
+def config_price_delta(line: dict, record: dict) -> tuple[float, str]:
+    """返回 (加价金额, 说明)。规则按"记录编号 + 询价配置关键词"匹配。"""
+    code = normalize_code(record.get("product_code"))
+    text = normalize_text(f"{line.get('name', '')} {line.get('spec', '')}")
+    for rule in CONFIG_PRICE_RULES:
+        if rule.get("record_code") and code != rule["record_code"]:
+            continue
+        if any(keyword in text for keyword in rule["keywords"]):
+            return float(rule["delta"]), str(rule["note"])
+    return 0.0, ""
+
+
+def _history_session(job):
+    """任务级绑定（B1）：返回读取价目本的会话。
+
+    未绑定库、或绑定的库文件已不存在时回退到系统默认库，保证历史任务与
+    未选库的报价行为与改造前完全一致。
+    """
+    key = (getattr(job, "database_key", "") or "").strip()
+    if not key or not (database.DATA_DIR / f"{key}.db").exists():
+        return database.SessionLocal()
+    return database.session_for_key(key)
+
+
+def _record_snapshot(record: dict) -> dict:
+    """把匹配用的历史记录转成 QuoteOption 的落库快照字段。
+
+    跨库报价时历史记录不在当前库中，``history_quote`` 关联为空，导出与前端
+    展示只能依赖这份快照。
+    """
+    return {
+        "record_source_file": record.get("source_file") or "",
+        "record_source_sheet": record.get("source_sheet") or "",
+        "record_source_row": int(record.get("source_row") or 0),
+        "record_name": record.get("name") or "",
+        "record_spec": record.get("spec") or "",
+        "record_model": record.get("model") or "",
+        "record_brand": record.get("brand") or "",
+        "record_manufacturer": record.get("manufacturer") or "",
+        "record_unit": record.get("unit") or "",
+        "record_product_code": record.get("product_code") or "",
+        "record_price": float(record.get("price") or 0),
+        "record_quote_date": record.get("quote_date") or "",
     }
 
 
 def process_job(job_id: str) -> None:
     db = database.SessionLocal()
+    history_db = None
     try:
         job = db.get(QuoteJob, job_id)
         if not job:
@@ -435,26 +474,37 @@ def process_job(job_id: str) -> None:
         parsed_lines = parse_quote_workbook(job.source_file_path)
         db.execute(delete(QuoteLine).where(QuoteLine.job_id == job_id))
         db.commit()
-        all_history = [_history_dict(item) for item in db.scalars(select(HistoryQuote)).all()]
-        # 候选池 = 公共历史库（customer_id 为空）+ 本任务客户的专属价目行；
-        # 其它客户的专属行直接丢弃，绝不进入本任务候选池。
-        # 缓存安全性：matching.py 的全部缓存（normalize_text/bigram_dice/
-        # name_core/parameter_similarity/_spec_features/category 推断等）都是
-        # 以字符串内容为键的 lru_cache 纯函数缓存，match_line 本身不做任何
-        # 候选池级缓存（history_version 只用于失效信号，并未作为缓存键），
-        # 因此候选池内容完全由本次调用的入参决定——合并池单次调用不会让
-        # 其它客户的专属行经缓存泄漏到本任务结果中。
-        shared = [item for item in all_history if item["customer_id"] is None]
-        exclusive = [
-            item
-            for item in all_history
-            if job.customer_id and item["customer_id"] == job.customer_id
-        ]
-        history = shared + exclusive
+        history_db = _history_session(job)
+        history = [_history_dict(item) for item in history_db.scalars(select(HistoryQuote)).all()]
         # 冷启动预热：把历史库元数据一次性算进 LRU 缓存，后续所有行
         # 的候选池排序/打分全部缓存命中（1675 行 × 全库 ≈ 500 万次
         # 重复解析 → 预热后全部 O(1) 命中）。
         warmup_match_caches(history)
+        # 任务级学段投票：询价表的配备标准编号（分类代码）命中的记录学段做多数
+        # 投票（≥60% 且 ≥3 票），作为同名候选的学段偏好——整表通常是同一学段的
+        # 配备清单（如高中 龙岩表 15/15 命中高中物理新课标），避免高中清单默认
+        # 选中初中版（直联泵 220 vs 340、感应圈 380 vs 220）。
+        # 任务级学段投票：只有命中"高中新课标"（高中物理/化学/生物新课标）的记录
+        # 才算强证据——高中物理新课标编号列完整（483 行有 84 个编号），而初中
+        # 新课标编号列与高中共享/混编且老价目本 5 位编号在高中老表也大量存在，
+        # 命中不代表清单学段。龙岩（高中清单）15 个高中新课标命中 → 高中；
+        # 预算清单（初中）与科学仪器（混合/无编号）→ 不产生偏好。
+        code_grades_map: dict[str, set[str]] = {}
+        for item in history:
+            key = normalize_code(item.get("product_code"))
+            if not key:
+                continue
+            sheet = str(item.get("source_sheet") or "")
+            if "新课标" in sheet:
+                code_grades_map.setdefault(key, set()).add(grade_marker(sheet))
+        grade_votes: dict[str, int] = {}
+        for raw_line in parsed_lines:
+            key = normalize_code(raw_line.get("product_code"))
+            if not key:
+                continue
+            if "高中" in code_grades_map.get(key, set()):
+                grade_votes["高中"] = grade_votes.get("高中", 0) + 1
+        job_grade = "高中" if grade_votes.get("高中", 0) >= 3 else ""
         customer = db.get(Customer, job.customer_id) if job.customer_id else None
         # Structured requirements apply to special and VIP customers only.
         requirements = []
@@ -477,15 +527,9 @@ def process_job(job_id: str) -> None:
             if normalize_text(item)
         }
         matched = review = unmatched = 0
-        # 每行匹配结果元数据：状态在循环结束后按复核预算统一分配
-        line_outcomes: list[dict] = []
         for index, raw_line in enumerate(parsed_lines):
             # 候选基于全历史库：精确同名/同码与通用名高分候选统一评分（候选池合并）
             candidates = match_line(raw_line, history, requirements)
-            # 客户专属价目标记：打分后统一追加一次，候选卡片/导出可追溯来源
-            for candidate in candidates:
-                if is_customer_exclusive(candidate.record) and "客户专属价目" not in candidate.reasons:
-                    candidate.reasons.append("客户专属价目")
             if preferred:
                 def preference_bonus(candidate):
                     identity = normalize_text(
@@ -524,10 +568,30 @@ def process_job(job_id: str) -> None:
                     f"BLOCK: VIP折扣需核对最低毛利线（{customer.minimum_margin_percent:g}%）"
                 )
             best_score = best.score if best else 0.0
+            # 精确同名候选放宽门槛：长规格文本会稀释参数分（分子结构模型 30 分档），
+            # 但同名+有价仍应给"待复核"方案而不是判无匹配走估算。
+            exact_name_best = bool(
+                best
+                and name_core(best.record.get("name", ""))
+                and name_core(best.record.get("name", "")) == name_core(raw_line.get("name", ""))
+            )
+            effective_floor = min(OPTION_FLOOR, 25.0) if exact_name_best else OPTION_FLOOR
+            if not best or best_score < effective_floor:
+                status = "unmatched"
+                confidence = "unreliable"
+                unmatched += 1
+            elif best.confidence == "unreliable" or best.confidence in ("review", "low", "medium") or needs_margin_approval:
+                status = "review"
+                confidence = "low" if best.confidence == "unreliable" else best.confidence
+                review += 1
+            else:
+                status = "suggested"
+                confidence = "high"
+                matched += 1
             line = QuoteLine(
                 job_id=job.id,
-                status="pending",  # 行状态在循环结束后按复核预算统一分配
-                confidence=best.confidence if best else "unreliable",
+                status=status,
+                confidence=confidence,
                 recommended_score=best.score if best else 0,
                 warnings=warnings,
                 **raw_line,
@@ -542,70 +606,49 @@ def process_job(job_id: str) -> None:
             # 量程隔离：与询价量程明显冲突的候选（500mm直尺 vs 1000mm询价）不参与
             # 中位数统计——否则 22元 1000mm钢直尺 会被 4.5元 500mm直尺 拉出 3.5x 误杀。
             line_feat = _spec_features(f"{raw_line.get('name','')} {raw_line.get('spec','')}")
+            line_spec_values = spec_values(f"{raw_line.get('name','')} {raw_line.get('spec','')}")
 
             def _same_range(item) -> bool:
-                record_feat = _spec_features(
-                    f"{item.record.get('name','')} {item.record.get('spec','')}"
-                )
+                record_text = f"{item.record.get('name','')} {item.record.get('spec','')}"
+                record_values = spec_values(record_text)
                 for unit in ("mm", "ml", "g", "a", "v", "w"):
-                    lv = line_feat["caps"].get(unit)
-                    rv = record_feat["caps"].get(unit)
-                    if lv and rv and (rv / lv > 1.5 or rv / lv < 1 / 1.5):
+                    lv = line_spec_values.get(unit)
+                    rv = record_values.get(unit)
+                    # 按"任一数值吻合"判断量程是否同一档（修复 300mm 总长 vs φ6mm
+                    # 直径被当成量程冲突，导致玻璃棒正确记录被排除在中位数之外）。
+                    if lv and rv and not _values_overlap(lv, rv, 0.6):
                         return False
                 return True
 
-            line_code_norm = normalize_text(raw_line.get("product_code", ""))
-
-            def _is_exact_code(item) -> bool:
-                """候选与询价产品编码精确一致：编码已锁定同一产品，
-                名称一字之差（手摇离心钻台↔转台）不再卡名称门槛。"""
-                return bool(line_code_norm) and normalize_text(item.record.get("product_code", "")) == line_code_norm
-
-            def _price_pool(require_exact_core: bool, exclude_trusted: bool = False) -> list[float]:
-                """价格守卫中位数组。require_exact_core=True 时只收核心名与询价
-                完全相等的记录（烧瓶刷 不再混入 烧瓶 的基准）；exact_code 命中的
-                记录视同同名（编码已锁定同一产品）。"""
-                pool: list[float] = []
-                for item in candidates:
-                    if not item.record.get("price") or not _same_range(item):
-                        continue
-                    if exclude_trusted and (
-                        is_saitel(item.record.get("source_file"))
-                        # 客户专属价目是协议价，不作为压赛特尔价格的"其它来源参照"
-                        or is_customer_exclusive(item.record)
-                    ):
-                        continue
-                    record_core = name_core(item.record.get("name", ""))
-                    if require_exact_core:
-                        name_ok = record_core == line_core_name
-                    else:
-                        # 核心词包含：电子天平 组只统计 电子天平，不混入 托盘天平/钩码 等
-                        # 仅 bigram 相似的产品——否则 14/30元 托盘天平 会把 385元 电子天平
-                        # 拉出 2x 守卫误杀，导致真实价被排除、走估算价兜底。
-                        name_ok = (
-                            bigram_dice(line_core_name, record_core) >= MATCH_NAME_FLOOR
-                            and (
-                                record_core in line_core_name
-                                or line_core_name in record_core
-                            )
-                        )
-                    if name_ok or _is_exact_code(item):
-                        pool.append(float(item.record.get("price", 0)))
-                return pool
-
-            # 优先用完全同名集合；不足 3 条时退回核心词包含逻辑（样本量保证）
-            group_prices = _price_pool(require_exact_core=True)
-            if len(group_prices) < 3:
-                group_prices = _price_pool(require_exact_core=False)
+            group_prices = [
+                float(item.record.get("price", 0))
+                for item in candidates
+                if item.record.get("price")
+                and bigram_dice(line_core_name, name_core(item.record.get("name", ""))) >= MATCH_NAME_FLOOR
+                and _same_range(item)
+                # 核心词包含：电子天平 组只统计 电子天平，不混入 托盘天平/钩码 等
+                # 仅 bigram 相似的产品——否则 14/30元 托盘天平 会把 385元 电子天平
+                # 拉出 2x 守卫误杀，导致真实价被排除、走估算价兜底。
+                and (
+                    name_core(item.record.get("name", "")) in line_core_name
+                    or line_core_name in name_core(item.record.get("name", ""))
+                )
+            ]
             group_median = robust_median(group_prices) if len(group_prices) >= 3 else 0.0
-            non_saitel_prices = _price_pool(require_exact_core=True, exclude_trusted=True)
-            if len(non_saitel_prices) < 3:
-                non_saitel_prices = _price_pool(require_exact_core=False, exclude_trusted=True)
+            non_saitel_prices = [
+                float(item.record.get("price", 0))
+                for item in candidates
+                if item.record.get("price")
+                and not is_saitel(item.record.get("source_file"))
+                and bigram_dice(line_core_name, name_core(item.record.get("name", ""))) >= MATCH_NAME_FLOOR
+                and _same_range(item)
+                and (
+                    name_core(item.record.get("name", "")) in line_core_name
+                    or line_core_name in name_core(item.record.get("name", ""))
+                )
+            ]
 
             def _price_guard(item) -> bool:
-                # 客户专属价目为受信协议价（可能远低于公共中位价），豁免价格守卫
-                if is_customer_exclusive(item.record):
-                    return True
                 if not group_median:
                     return True
                 price = float(item.record.get("price", 0))
@@ -618,13 +661,10 @@ def process_job(job_id: str) -> None:
             eligible = [
                 item
                 for item in candidates
-                if item.score >= _autoselect_floor(item.record)
-                and (
-                    # exact_code 命中跳过名称门槛（match_line 池级 code_compatible
-                    # 已防跨编码体系冲突）
-                    _is_exact_code(item)
-                    or name_allows_autoselect(line_name, item.record.get("name", ""), item.record.get("source_file"))
-                )
+                if item.score >= (SAITEL_FLOOR if is_saitel(item.record.get("source_file")) else AUTOSELECT_FLOOR)
+                # 无价格条目（高中物理新课标等配备标准）只参与识别，不默认报价。
+                and item.record.get("price")
+                and name_allows_autoselect(line_name, item.record.get("name", ""), item.record.get("source_file"))
                 and _price_guard(item)
             ]
 
@@ -646,9 +686,6 @@ def process_job(job_id: str) -> None:
             # 物理学科 sheet（初中物理/高中物理）再优先于小学/其他学科——天文望远镜
             # 询价是初中物理档（280元），不能被 小学科学 的 160元 压过。
             def _legacy_sheet_priority(item) -> int:
-                # 客户专属价目行永远最高优先（比物理老编号体系的 0 档更靠前）
-                if is_customer_exclusive(item.record):
-                    return -1
                 sheet = str(item.record.get("source_sheet") or "")
                 if sheet in ("初中物理", "高中物理"):
                     return 0
@@ -659,53 +696,137 @@ def process_job(job_id: str) -> None:
                 return 2
 
             # 赛特尔优先：有赛特尔候选时仅默认选中赛特尔（报价1 为赛特尔），
-            # 其余来源仍作为备选展示；赛特尔内部按名称匹配质量→分数排序。
-            # 变体守卫：赛特尔候选若带规格类/修饰词变体/BLOCK 警告（如初中电源
-            # 顶替高中电源），不默认选中，避免“有赛特尔选赛特尔”引入错配。
+            # 其余来源仍作为备选展示；赛特尔内部按名称匹配质量→学段→分数排序。
+            # 变体守卫：赛特尔候选若带 规格变体/BLOCK 警告（如初中电源顶替高中
+            # 电源），不默认选中；“规格量程”告警对同名候选放宽——同名多版本里
+            # 的 220mm vs Φ60mm 之类不同维度数字比对常有噪声（分数已含罚分）。
+            def _default_warning_block(item) -> bool:
+                exact_name = _name_quality(item) == 2
+                for warning in item.warnings:
+                    text = str(warning)
+                    if text.startswith("规格变体"):
+                        return True
+                    if text.startswith("BLOCK:"):
+                        # 单位不可换算（玻璃棒：询价"个" vs 历史"千克"）：同名记录
+                        # 规格/编号吻合时允许默认选中并转人工复核，避免整行退化到
+                        # 规格不符的低价错配记录（64054 1.3 元 vs 正确 12 元）。
+                        if exact_name and text.startswith("BLOCK: 单位不可直接换算"):
+                            continue
+                        return True
+                    if text.startswith("规格量程") and not exact_name:
+                        return True
+                return False
+
             saitel_eligible = [
                 item
                 for item in eligible
-                if is_saitel(item.record.get("source_file"))
-                and not any(
-                    str(warning).startswith(VARIANT_GUARD_PREFIXES)
-                    for warning in item.warnings
-                )
+                if is_saitel(item.record.get("source_file")) and not _default_warning_block(item)
             ]
-            # 客户专属价目优先级最高（高于赛特尔）：同样带变体守卫，
-            # 带规格类/修饰词变体/BLOCK 警告的专属候选不默认选中。
-            exclusive_eligible = [
+            # 目录里存在“同名配备标准条目但无价格”时（如高中物理新课标），不用旧
+            # 课标近似品顶替默认选中——留待人工/待复核，避免错配报价。
+            priced_exact = [
                 item
                 for item in eligible
-                if is_customer_exclusive(item.record)
-                and not any(
-                    str(warning).startswith(VARIANT_GUARD_PREFIXES)
-                    for warning in item.warnings
-                )
+                if _name_quality(item) == 2 and float(item.record.get("price", 0) or 0) > 0
             ]
-            default_pool = (
-                exclusive_eligible
-                if exclusive_eligible
-                else (saitel_eligible if saitel_eligible else eligible)
+            top_candidate = candidates[0] if candidates else None
+            suppress_defaults = bool(
+                top_candidate is not None
+                and _name_quality(top_candidate) == 2
+                and not top_candidate.record.get("price")
+                and is_saitel(top_candidate.record.get("source_file"))
+                and not priced_exact
             )
-            # 名称质量优先（同核心词候选先于变体名），参数分量次之（同码不同规格
-            # 由此分出先后，注射器 10/50/100mL 不再同价）；老编号体系 sheet 仅在
-            # 名称质量相同时做价位 tiebreak（如 压力和压强演示器 9元 优先 22元）；
-            # 不能把 老编号 排在 名称质量 前——否则 木直尺(初中物理) 会压过
-            # 真正同名的 直尺(1000mm塑料) 候选。
-            # 守卫池为空回退到 eligible 时同样按此 key 排序，回退不等于乱选。
-            default_pool.sort(key=lambda item: (-_name_quality(item), -item.component_scores.get("参数", 0), _legacy_sheet_priority(item), -item.score))
+            if suppress_defaults:
+                line.warnings = list(line.warnings or []) + ["目录中同名配备标准条目无价格，需人工询价"]
+
+            # 学段优先：清单整体学段（任务级投票）作为同名同价的偏好——高中清单
+            # 不拿初中版（直联泵 340 vs 220）。编号命中不单独判学段：新标准编号
+            # 跨学段共享，命中初中新课标不代表清单是初中。
+            line_grade = job_grade
+
+            def _grade_rank(item) -> int:
+                if not line_grade:
+                    return 0
+                record_grade = grade_marker(
+                    item.record.get("source_sheet") or item.record.get("name", "")
+                )
+                return 0 if record_grade == line_grade else 1
+
+            def _spec_rank(item) -> int:
+                # 同品名同分时，无规格说明的记录让位给有规格的（可核验性优先），
+                # 兼容 价目本导出名带脏后缀/新老版本并存 的精确同名竞争（58 vs 22）。
+                return 0 if str(item.record.get("spec") or "").strip() else 1
+
+            _HARD_MISMATCH_PREFIXES = (
+                "规格量程", "规格尺寸", "规格件数", "规格倍率", "规格倍数",
+                "规格形状", "规格型号", "规格变体", "规格定位", "规格配置不符",
+                "磁钢型号", "修饰词变体",
+            )
+
+            def _mismatch_rank(item) -> int:
+                # 带硬规格冲突的候选排在吻合候选之后（分数已扣，但避免老体系
+                # 优先级再次把它们提到前面）。
+                return 1 if any(
+                    str(warning).startswith(_HARD_MISMATCH_PREFIXES) for warning in item.warnings
+                ) else 0
+
+            def _catalog_rank(item) -> int:
+                # 新配备标准 sheet（初中新课标物理/高中物理新课标…）用于识别与
+                # 参数对照，同品名有老价目本记录时优先老价目本（用户口径：
+                # 老课标优先——弹簧组 21006 应报 12 元而不是新课标 40 元）。
+                sheet = str(item.record.get("source_sheet") or "")
+                return 1 if "新课标" in sheet else 0
+
+            def _variant_rank(item) -> int:
+                # 定位/配置一致优先：询价"演示用"应匹配演示用记录（分子结构模型
+                # 演示用 140 vs 初中用 55 同分并列），"学生分组用"匹配分组用，
+                # "含支杆"匹配含支杆版本。
+                line_flags = _spec_features(f"{raw_line.get('name','')} {raw_line.get('spec','')}")
+                record_flags = _spec_features(
+                    f"{item.record.get('name','')} {item.record.get('spec','')}"
+                )
+                for key in ("teaching", "grouped", "student", "branch"):
+                    if line_flags.get(key) and record_flags.get(key):
+                        return 0
+                return 1
+
+            default_pool = saitel_eligible if saitel_eligible else eligible
+            # 名称质量 > 规格可核验性 > 老价目本 > 无硬规格冲突 > 定位一致 >
+            # 学段一致 > 分数 > 老体系。老价目本优先于硬冲突：用户口径按老价目本
+            # 报基准价（枕形导体 老 35 元 vs 新课标 40 元），规格差异走提示/复核。
+            default_pool.sort(
+                key=lambda item: (
+                    -_name_quality(item),
+                    _spec_rank(item),
+                    _catalog_rank(item),
+                    _mismatch_rank(item),
+                    _variant_rank(item),
+                    _grade_rank(item),
+                    -item.score,
+                    _legacy_sheet_priority(item),
+                )
+            )
             defaults = {item.record["id"] for item in distinct_manufacturer_options(default_pool, job.requested_option_count, min_score=SAITEL_FLOOR)}
-            # 默认方案按“同核心词×价位簇”去重：同品同价位只保留一个默认选中，
-            # 避免 3 个同价赛特尔方案占满 TOP 区，把不同价位挤到后面。
-            seen_level: dict[str, list[float]] = {}
+            if suppress_defaults:
+                defaults = set()
+            # 默认方案按“同核心词×价位簇×厂商”去重：同品同价位且同一厂商（或厂商
+            # 未知）只保留一个默认选中，避免 3 个同价赛特尔方案占满 TOP 区，把不同
+            # 价位挤到后面；不同厂商即使同价也是独立方案——多厂商价目库里多家同价
+            # 是常态，只有全部保留才能出多厂商报价。
+            seen_level: dict[str, list[tuple[str, float]]] = {}
 
             def _keep_default(item) -> bool:
                 key = name_core(item.record.get("name", "")) or "?"
                 price = float(item.record.get("price", 0))
+                identity = normalize_text(item.record.get("manufacturer") or item.record.get("brand"))
                 levels = seen_level.setdefault(key, [])
-                if any(abs(price - prev) / max(prev, 1e-9) <= 0.30 for prev in levels):
-                    return False
-                levels.append(price)
+                for prev_identity, prev in levels:
+                    if abs(price - prev) / max(prev, 1e-9) > 0.30:
+                        continue
+                    if not identity or not prev_identity or identity == prev_identity:
+                        return False
+                levels.append((identity, price))
                 return True
 
             defaults = {item.record["id"] for item in default_pool if item.record["id"] in defaults and _keep_default(item)}
@@ -719,24 +840,26 @@ def process_job(job_id: str) -> None:
                 candidates,
                 key=lambda item: (
                     item.record["id"] not in defaults,
-                    # 名称质量优先；参数分量次之（同码不同规格的变体由此排序，
-                    # 报价1 给参数最吻合的记录）；老编号体系 sheet 仅在同名
-                    # 多价时做价位 tiebreak
+                    # 名称质量 > 规格可核验性 > 老价目本 > 无硬规格冲突 >
+                    # 定位一致 > 学段一致 > 分数 > 老体系
                     -_name_quality(item),
-                    -item.component_scores.get("参数", 0),
-                    _legacy_sheet_priority(item),
+                    _spec_rank(item),
+                    _catalog_rank(item),
+                    _mismatch_rank(item),
+                    _variant_rank(item),
+                    _grade_rank(item),
                     -item.score,
+                    _legacy_sheet_priority(item),
                 ),
             )
             ordered_candidates = diversify_price_levels(base_order, defaults, line_core_name)
             for candidate in ordered_candidates:
                 record = candidate.record
                 base_price = candidate.normalized_price or float(record["price"])
-                # 客户专属价目为最终协议价：不再叠加 VIP 协议折扣
-                if is_customer_exclusive(record):
-                    final_price = round(base_price, 2)
-                else:
-                    final_price = round(base_price * (1 - discount / 100), 2)
+                config_delta, config_note = config_price_delta(raw_line, record)
+                if config_delta:
+                    base_price = round(base_price + config_delta, 2)
+                final_price = round(base_price * (1 - discount / 100), 2)
                 dedup_key = (
                     normalize_text(record.get("manufacturer") or record.get("brand")),
                     final_price,
@@ -748,11 +871,15 @@ def process_job(job_id: str) -> None:
                 seen_option_keys.add(dedup_key)
                 rank += 1
                 option_warnings = list(candidate.warnings)
+                if config_delta:
+                    option_warnings.append(
+                        f"配置加价：{config_note}（{float(record['price']):g}→{base_price:g}）"
+                    )
                 if not _price_guard(candidate) and group_median:
                     option_warnings.append(
                         f"价格异常：偏离同组中位数（¥{group_median:g}）超过2倍，需人工核对"
                     )
-                if discount and not is_customer_exclusive(record):
+                if discount:
                     option_warnings.append(f"已应用客户折扣 {discount:g}% ，需核对毛利")
                 if needs_margin_approval:
                     option_warnings.append(
@@ -770,12 +897,17 @@ def process_job(job_id: str) -> None:
                         warnings=option_warnings,
                         unit_status=candidate.unit_status,
                         normalized_price=candidate.normalized_price,
-                        selected=record["id"] in defaults and candidate.score >= _autoselect_floor(record),
+                        selected=record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR),
                         final_price=final_price,
+                        **_record_snapshot(record),
                     )
                 )
-                if record["id"] in defaults and candidate.score >= _autoselect_floor(record):
+                if record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR):
                     line_has_selected = True
+                    if config_delta and not any("配置加价" in str(w) for w in (line.warnings or [])):
+                        line.warnings = list(line.warnings or []) + [
+                            f"配置加价：{config_note}（{float(record['price']):g}→{base_price:g}）"
+                        ]
             if not line_has_selected and group_prices:
                 # 估算价兜底：无默认选中时按"同 JY/名称类目+同学段"的第 10 分位价
                 # 生成保守估算方案（类目分位比核心词组更稳定，避免错配产品拖低
@@ -802,12 +934,13 @@ def process_job(job_id: str) -> None:
                     est_base = sorted_prices[min(len(sorted_prices) - 1, len(sorted_prices) // 4)]
                     est_label = "同核心词组低位分位"
                 est_price = round(est_base * (1 - discount / 100), 2)
-                pick = min(candidates, key=lambda item: abs(float(item.record.get("price", 0)) - est_base)) if candidates else None
                 rank += 1
                 db.add(
                     QuoteOption(
                         line_id=line.id,
-                        history_quote_id=pick.record["id"] if pick else None,
+                        # 估算方案不关联具体历史记录：避免把随机记录（司南）的
+                        # 规格/编码带进导出（曾出现"分子结构模型"参数=司南、单价=1.1）。
+                        history_quote_id=None,
                         rank=rank,
                         score=0.0,
                         confidence="low",
@@ -816,67 +949,15 @@ def process_job(job_id: str) -> None:
                         warnings=[f"估算价：按{est_label}（¥{est_base:g}）生成，需人工复核"],
                         unit_status="exact",
                         normalized_price=None,
-                        selected=True,
+                        # 估算仅供参考，不默认选中——避免垃圾价（1.1 元）写进报价单。
+                        selected=False,
                         final_price=est_price,
                     )
                 )
-                warnings.append(f"估算价：按{est_label}生成，需人工复核")
-            # 收集行状态元数据（best.warnings 上的 severe/阻断判定只用于状态分配，
-            # 不影响候选打分与默认选中）
-            best_warnings = list(best.warnings) if best else []
-            line_outcomes.append(
-                {
-                    "line": line,
-                    "best_score": best_score,
-                    "best_confidence": best.confidence if best else "unreliable",
-                    "severe": any(
-                        str(warning).startswith(VARIANT_GUARD_PREFIXES)
-                        for warning in best_warnings
-                    ),
-                    "has_block": any(
-                        str(warning).startswith("BLOCK:") for warning in best_warnings
-                    ),
-                    "has_candidates": bool(candidates),
-                    "has_selected": line_has_selected,
-                    "needs_margin_approval": needs_margin_approval,
-                }
-            )
+                warnings.append(f"估算价（参考）：按{est_label}生成，需人工复核")
             if index % 200 == 0:
                 job.progress = min(95, 5 + int((index + 1) / len(parsed_lines) * 90))
                 db.commit()
-        # 行状态统一分配：hard-manual（无候选/无默认选中/BLOCK/VIP毛利核对）永远
-        # 保留人工处理、不占复核额度；其余行按"severe 警告优先、低分优先"降级进
-        # 复核，直到 复核+无匹配 行数达到 REVIEW_TARGET_PERCENT 目标比例。
-        total = len(line_outcomes)
-        target = 0 if total <= 3 else math.ceil(total * REVIEW_TARGET_PERCENT / 100)
-        for item in line_outcomes:
-            item["hard"] = (
-                not item["has_candidates"]
-                or not item["has_selected"]
-                or item["has_block"]
-                or item["needs_margin_approval"]
-            )
-        hard_count = sum(1 for item in line_outcomes if item["hard"])
-        budget = max(0, target - hard_count)
-        soft = [item for item in line_outcomes if not item["hard"]]
-        soft.sort(key=lambda item: (not item["severe"], item["best_score"]))
-        demoted_lines = {id(item["line"]) for item in soft[:budget]}
-        for item in line_outcomes:
-            line = item["line"]
-            if not item["has_candidates"] or not item["has_selected"]:
-                line.status = "unmatched"
-                line.confidence = "unreliable"
-                unmatched += 1
-            elif item["hard"] or id(line) in demoted_lines:
-                line.status = "review"
-                line.confidence = (
-                    "low" if item["best_confidence"] == "unreliable" else item["best_confidence"]
-                )
-                review += 1
-            else:
-                line.status = "suggested"
-                line.confidence = "high"
-                matched += 1
         job.total_lines = len(parsed_lines)
         job.matched_lines = matched
         job.review_lines = review
@@ -896,6 +977,8 @@ def process_job(job_id: str) -> None:
             db.commit()
     finally:
         db.close()
+        if history_db is not None and history_db is not db:
+            history_db.close()
 
 
 def run_worker() -> None:

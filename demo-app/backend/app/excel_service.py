@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import csv
+import io
 import unicodedata
 import difflib
 from dataclasses import dataclass
@@ -18,8 +20,8 @@ except ImportError:  # pragma: no cover
 
 HEADER_ALIASES = {
     "name": ("采购品目", "货物名称", "产品名称", "品名", "器材名称", "设备名称", "仪器名称", "名称"),
-    "product_code": ("产品编码", "编码", "编号", "货号"),
-    "quantity": ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数", "参考数量"),
+    "product_code": ("产品编码", "编码", "编号", "货号", "分类代码", "品牌型号"),
+    "quantity": ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数"),
     "unit": ("单位", "计量单位"),
     "spec": ("参数", "技术参数", "主要技术参数", "主要性能要求", "技术性能要求", "性能要求", "规格", "规格参数", "规格说明", "技术要求"),
     "model": ("规格型号", "型号", "规格"),
@@ -51,50 +53,32 @@ def normalize_header_key(value: object) -> str:
     return re.sub(r"[\s\u3000]+", "", str(value or "")).lower()
 
 
-# 字段表头词全集：分段报价表会在数据区重复出现表头行
-# （"序号|名称|规格|单位|数量"），其名称列内容就是表头词本身。
-_HEADER_LABELS = {
-    normalize_header_key(alias)
-    for aliases in HEADER_ALIASES.values()
-    for alias in aliases
-}
-
-
 JY_CODE_RE = re.compile(r"^\d{5}$")
 LINE_CODE_RE = re.compile(r"(?<![\dA-Za-z])([0-8]\d{4})(?![0-9A-Za-z.:+])")
 
 
 def normalize_code_fields(record: dict) -> dict:
-    """Move a JY five-digit product code mis-stored as 型号 into 产品编码.
+    """Normalize 编号/型号 fields for matching.
 
-    The 高中理化生报价(凯迪) style price books put the JY 教育装备编码
-    (e.g. 04013 起电机) in the 规格型号 column. Treat a pure five-digit
-    ``model`` as the authoritative product code so it can drive exact-code
-    matching and stop polluting the 型号 column.  Long free-text kept in the
-    same column (海口赛特尔 style 规格型号) is spec text, so it moves to spec.
+    - Strip accidental ".0" suffixes from numeric codes (30307216301.0 → 30307216301).
+    - Move a JY five-digit product code mis-stored as 型号 into 产品编码
+      (高中理化生报价(凯迪) style price books put the JY 编码 in 规格型号).
+    - Long free text kept in the 型号 column (海口赛特尔 style 规格型号) is spec
+      text, so it moves to spec when the sheet has no spec column.
     """
-    model = str(record.get("model") or "").strip()
+    result = dict(record)
+    result["product_code"] = normalize_standard_code(result.get("product_code"))
+    model = normalize_standard_code(result.get("model"))
     if model and JY_CODE_RE.match(model):
-        record = dict(record)
-        if not record.get("product_code"):
-            record["product_code"] = model
-        record["model"] = ""
-    elif model and len(model) > 20 and not record.get("spec"):
-        record = dict(record)
-        record["spec"] = model
-        record["model"] = ""
-    return record
-
-
-def strip_code_decimal_suffix(value: object) -> str:
-    """xls 数值格把编码读成 "27001.0"：纯整数+.0 形态去小数后缀还原编码。
-
-    只处理"纯整数+.0"形态，真实含小数的编码（如 "3.5"）不受影响。
-    """
-    text = str(value or "").strip()
-    if text.endswith(".0") and text[:-2].isdigit():
-        return text[:-2]
-    return text
+        if not result.get("product_code"):
+            result["product_code"] = model
+        result["model"] = ""
+    elif model and len(model) > 20 and not result.get("spec"):
+        result["spec"] = model
+        result["model"] = ""
+    elif model != str(record.get("model") or "").strip():
+        result["model"] = model
+    return result
 
 
 def extract_line_code(*texts: object) -> str:
@@ -207,31 +191,6 @@ def find_header(ws, extra_aliases: dict | None = None, start_row: int = 1) -> tu
                 ),
                 0,
             )
-        # 合并单元格表头：主表头行整列合并（如“单位”跨 单位/数量/单价 多列），
-        # 子表头（“参考数量”“单价”）写在下一行。仍缺的字段到下一行补认，仅接受
-        # 主表头行对应单元格为空的列，避免把数据行误判成表头。
-        if row_number < ws.max_row:
-            sub_values = [
-                normalize_header_key(ws.cell(row_number + 1, column))
-                for column in range(1, ws.max_column + 1)
-            ]
-            taken = {index for index in columns.values() if index}
-            for field, aliases in normalized_aliases.items():
-                if columns.get(field):
-                    continue
-                match = next(
-                    (
-                        index + 1
-                        for index, value in enumerate(sub_values)
-                        if value in aliases
-                        and index + 1 not in taken
-                        and not normalize_header_key(ws.cell(row_number, index + 1))
-                    ),
-                    0,
-                )
-                if match:
-                    columns[field] = match
-                    taken.add(match)
         return row_number, columns
     return None
 
@@ -331,6 +290,65 @@ class XlsWorkbookAdapter:
         pass
 
 
+class CsvSheetAdapter:
+    __slots__ = ("_rows", "_title")
+
+    def __init__(self, rows: list[list[str]], title: str):
+        self._rows = rows
+        self._title = title
+
+    @property
+    def title(self) -> str:
+        return self._title
+
+    @property
+    def max_row(self) -> int:
+        return len(self._rows)
+
+    @property
+    def max_column(self) -> int:
+        return max((len(row) for row in self._rows), default=0)
+
+    def cell(self, row: int, column: int):
+        if row < 1 or row > len(self._rows):
+            return None
+        values = self._rows[row - 1]
+        if column < 1 or column > len(values):
+            return None
+        return values[column - 1]
+
+    def data_type(self, row: int, column: int) -> str | None:
+        return None  # CSV 无公式
+
+
+class CsvWorkbookAdapter:
+    __slots__ = ("_path", "_rows")
+
+    def __init__(self, path: str):
+        raw = Path(path).read_bytes()
+        text = None
+        for encoding in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise ValueError("无法识别 CSV 文件编码（仅支持 UTF-8 / GBK）")
+        self._path = path
+        self._rows = [row for row in csv.reader(io.StringIO(text)) if any(cell.strip() for cell in row)]
+
+    @property
+    def sheets(self) -> list:
+        return [CsvSheetAdapter(self._rows, Path(self._path).stem or "CSV")]
+
+    def formula_sheet(self, title: str):
+        return None  # CSV 无公式
+
+    def close(self) -> None:
+        pass
+
+
 @dataclass
 class WorkbookAdapter:
     """Version-agnostic workbook handle returned by open_workbook()."""
@@ -350,11 +368,13 @@ class WorkbookAdapter:
 
 def open_workbook(path: str) -> WorkbookAdapter:
     lower = str(path).lower()
-    if lower.endswith(".xls") and not lower.endswith(".xlsx") and not lower.endswith(".xlsm"):
+    if lower.endswith(".xls") and not lower.endswith((".xlsx", ".xlsm")):
         return WorkbookAdapter(XlsWorkbookAdapter(path), path)
     if lower.endswith((".xlsx", ".xlsm")):
         return WorkbookAdapter(XlsxWorkbookAdapter(path), path)
-    raise ValueError("仅支持 .xlsx / .xlsm / .xls 文件")
+    if lower.endswith(".csv"):
+        return WorkbookAdapter(CsvWorkbookAdapter(path), path)
+    raise ValueError("仅支持 .xlsx / .xlsm / .xls / .csv 文件")
 
 
 def parse_quote_workbook(path: str) -> list[dict]:
@@ -375,12 +395,6 @@ def parse_quote_workbook(path: str) -> list[dict]:
             name = cell_name(ws.cell(row_number, columns["name"]))
             spec = cell_text(ws.cell(row_number, columns["spec"])) if columns["spec"] else ""
             if not name or re.fullmatch(r"(?:小计|合计|总计|配置班额|一般|合计金额)", name):
-                continue
-            # 分段报价表在数据区重复出现的表头行（名称列="名称"、参数列="规格"），
-            # 不是产品行——跳过，避免生成"名称=名称"的空壳行混进"无匹配"。
-            if normalize_header_key(name) in _HEADER_LABELS and (
-                not spec or normalize_header_key(spec) in _HEADER_LABELS
-            ):
                 continue
             if re.match(r"^共\s*\d+", spec) or "配置清单如下" in spec:
                 continue
@@ -450,38 +464,45 @@ TAX_INCLUSIVE_RATE = float(os.getenv("HISTORY_TAX_RATE", "0.10"))
 def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
     """Parse every sheet of a history-quote workbook into raw records.
 
-    A valid row needs a non-empty name; the price column must exist in the
-    sheet header.  Rows with a missing/non-positive price are still returned
-    (``price=None``) so the caller can count them as invalid.
+    A valid row needs a non-empty name.  Sheets without a price column (e.g.
+    高中物理新课标 配备标准) are still imported with ``price=None`` so their
+    名称/规格 can drive matching, and are flagged via ``has_price_column`` so
+    callers never quote them.  Rows with a missing/non-positive price in a
+    priced sheet are returned with ``price=None`` for the caller to count.
     """
     workbook = open_workbook(path)
     records: list[dict] = []
     price_column_found = False
     for ws in workbook.sheets:
         header = find_header(ws, {"price": PRICE_ALIASES})
-        if not header or not header[1].get("price"):
+        if not header:
             continue
-        price_column_found = True
         header_row, columns = header
+        has_price_column = bool(columns.get("price"))
+        if has_price_column:
+            price_column_found = True
+        elif not (columns.get("name") and (columns.get("spec") or columns.get("unit"))):
+            continue
         # “含税单价/含税价格”类表头按固定含税率折回税前基准，避免导出再乘税（双重计税）。
         # 注意 “不含税单价” 也含 “含税” 子串，必须先排除 “不含”。
-        price_label = cell_text(ws.cell(header_row, columns["price"]))
-        tax_inclusive = ("含税" in price_label) and ("不含" not in price_label)
+        price_label = cell_text(ws.cell(header_row, columns["price"])) if has_price_column else ""
+        tax_inclusive = has_price_column and ("含税" in price_label) and ("不含" not in price_label)
         for row_number in range(header_row + 1, ws.max_row + 1):
             # 投标分项报价表常含多段表头（不同学科/学校，列位置不同）：识别
             # “序号/名称…单价（元）”形态的新表头行并切换解析列。
             name_cell = cell_text(ws.cell(row_number, columns["name"]))
-            if name_cell in ("序号", "名称", "目录"):
-                new_header = find_header(ws, {"price": PRICE_ALIASES}, start_row=row_number)
-                if new_header and new_header[1].get("price"):
-                    header_row, columns = new_header
-                    price_label = cell_text(ws.cell(header_row, columns["price"]))
-                    tax_inclusive = ("含税" in price_label) and ("不含" not in price_label)
-                    continue
+            if name_cell in ("序号", "名称", "目录", "器材名称", "品名"):
+                if has_price_column:
+                    new_header = find_header(ws, {"price": PRICE_ALIASES}, start_row=row_number)
+                    if new_header and new_header[1].get("price"):
+                        header_row, columns = new_header
+                        price_label = cell_text(ws.cell(header_row, columns["price"]))
+                        tax_inclusive = ("含税" in price_label) and ("不含" not in price_label)
+                continue
             name = cell_name(ws.cell(row_number, columns["name"]))
             if not name or re.fullmatch(r"(?:小计|合计|总计|配置班额|一般|合计金额|单套合计|单套金额|目录)", name):
                 continue
-            price = number_value(ws.cell(row_number, columns["price"]))
+            price = number_value(ws.cell(row_number, columns["price"])) if has_price_column else None
             if tax_inclusive and price:
                 price = round(price / (1 + TAX_INCLUSIVE_RATE), 2)
             record = {
@@ -489,14 +510,13 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
                 "source_row": row_number,
                 "name": name,
                 "spec": cell_text(ws.cell(row_number, columns["spec"])) if columns.get("spec") else "",
-                # xls 数值格编码去 ".0" 后缀（"27001.0"→"27001"），
-                # 否则 normalize_text 后变 270010，exact-code 分流整体失效
-                "product_code": strip_code_decimal_suffix(cell_text(ws.cell(row_number, columns["product_code"]))) if columns.get("product_code") else "",
-                "model": strip_code_decimal_suffix(cell_text(ws.cell(row_number, columns["model"]))) if columns.get("model") else "",
+                "product_code": cell_text(ws.cell(row_number, columns["product_code"])) if columns.get("product_code") else "",
+                "model": cell_text(ws.cell(row_number, columns["model"])) if columns.get("model") else "",
                 "brand": cell_text(ws.cell(row_number, columns["brand"])) if columns.get("brand") else "",
                 "manufacturer": cell_text(ws.cell(row_number, columns["manufacturer"])) if columns.get("manufacturer") else "",
                 "unit": cell_text(ws.cell(row_number, columns["unit"])) if columns.get("unit") else "",
                 "price": price,
+                "has_price_column": has_price_column,
             }
             records.append(normalize_code_fields(record))
     workbook.close()
@@ -505,9 +525,17 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
     return records
 
 
-def _option_field(option, field: str):
-    """Read a descriptive field from the linked history quote, or from the
-    manual_* columns for history-free manual options."""
+def option_field(option, field: str):
+    """读取方案的描述字段，三级回退：
+
+    1. 匹配时落库的 ``record_*`` 快照——跨库报价时历史记录不在当前库中，
+       外键关联为空，只有快照可用；
+    2. 关联的历史报价记录；
+    3. 无历史记录的手工方案 ``manual_*`` 字段。
+    """
+    snapshot = getattr(option, f"record_{field}", None)
+    if snapshot:
+        return snapshot
     history = option.history_quote
     if history is not None:
         return getattr(history, field) or ""
@@ -637,7 +665,13 @@ def _fallback_spec(record, inquiry_spec: object, cache) -> str:
     return _pick_spec_alias(pool, inquiry_spec) or ""
 
 
-def _option_source(option) -> str:
+def option_source(option) -> str:
+    source_file = getattr(option, "record_source_file", "")
+    if source_file:
+        return (
+            f"{source_file}｜{option.record_source_sheet or ''}"
+            f"｜第{option.record_source_row or 0}行"
+        )
     history = option.history_quote
     if history is None:
         return "手工方案"
@@ -652,12 +686,12 @@ def _option_values(option, include_internal: bool, quantity: float | None = None
     tax_subtotal = round(tax_unit * quantity, 2) if quantity else ""
     base = [
         option.rank,
-        _option_field(option, "manufacturer") or "未记录制造商",
-        _option_field(option, "brand"),
-        _option_field(option, "model"),
-        _option_field(option, "product_code"),
-        _option_field(option, "spec"),
-        _option_field(option, "unit"),
+        option_field(option, "manufacturer") or "未记录制造商",
+        option_field(option, "brand"),
+        option_field(option, "model"),
+        option_field(option, "product_code"),
+        option_field(option, "spec"),
+        option_field(option, "unit"),
         quantity or "",
         option.final_price,
         tax_unit,
@@ -670,7 +704,7 @@ def _option_values(option, include_internal: bool, quantity: float | None = None
             [
                 option.score,
                 "；".join(option.warnings or []),
-                _option_source(option),
+                option_source(option),
             ]
         )
     return base
@@ -701,6 +735,17 @@ def xls_to_xlsx(source_path: str, output_path: str) -> str:
     return output_path
 
 
+# 报价2~N 的列组：每个方案都要带齐这些描述列，否则多方案报价只有首个方案
+# 带品牌/型号/产品编码/规格，后续方案只剩单价与制造商。
+EXTRA_OPTION_FIELDS: tuple[str, ...] = ("单价", "制造商", "品牌", "型号", "产品编码", "规格")
+
+
+def _style_export_header(cell) -> None:
+    cell.font = Font(bold=True, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor="0F766E")
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
 def create_export(job, variant: str, output_path: str, db=None) -> str:
     include_internal = variant == "internal"
     rate = float(getattr(job, "tax_rate", 0.10) or 0.10)
@@ -718,17 +763,24 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
         if not relevant:
             continue
         header_row = max(1, min(line.source_row for line in relevant) - 1)
-        extra_option_count = max(0, (job.requested_option_count or 1) - 1)
+        # 列组按"实际会写出的最大方案数"生成：客户版只写已确认行，内部复核版写全部行。
+        # 若把未确认行也计入，它们自动带出的备选方案会撑出一整组没人写入的空列；
+        # 同时也不超过任务请求的方案数。
+        exportable = relevant if include_internal else [line for line in relevant if line.confirmed]
+        max_selected = max(
+            (sum(1 for item in line.options if item.selected) for line in exportable),
+            default=0,
+        )
+        requested = max(1, job.requested_option_count or 1)
+        extra_option_count = max(0, min(requested, max(1, max_selected)) - 1)
 
         # 原表各列表头已在行内时优先复用，避免导出重复的 数量/单位 等列。
-        # 复用列只做同值回填；已有内容的单元格绝不覆盖（见下方写入守卫）。
         existing: dict[str, int] = {}
         for column in range(1, ws.max_column + 1):
             label = ws.cell(header_row, column).value
             if label:
                 existing.setdefault(normalize_header_key(label), column)
         assign: dict[str, int] = {}
-        reused_columns: set[int] = set()
         next_col = ws.max_column + 1
 
         def ensure(field: str, header_label: str, key_hints: tuple[str, ...]) -> None:
@@ -736,31 +788,38 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
             for key in key_hints:
                 if key in existing:
                     assign[field] = existing[key]
-                    reused_columns.add(existing[key])
                     return
             col = next_col
             cell = ws.cell(header_row, col, header_label)
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="0F766E")
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            _style_export_header(cell)
             assign[field] = col
             next_col += 1
 
-        # 确认单价/总价是本次匹配的新结果，必须追加新列：原表的“单价”“金额”
-        # 列是客户已有内容（可能带公式），写入会覆盖原值，只允许补充不允许改写。
-        ensure("数量", "数量", ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数", "参考数量"))
-        ensure("确认单价", "确认单价", ("确认单价",))
+        ensure("数量", "数量", ("数量", "需求数量", "采购数量", "配置数量", "每套数量", "套数"))
+        # 方案1的列组与 报价2~N 同一命名规则、同一字段顺序：报价1单价→报价1制造商→
+        # 报价1品牌→报价1型号→报价1产品编码（与 EXTRA_OPTION_FIELDS 口径一致）。
+        # 复用原表同名列时把表头一并改写成 报价1*，保证导出表头命名统一。
+        ensure("确认单价", "报价1单价", ("报价1单价", "确认单价", "单价"))
         ensure("税后单价", "税后单价", ("税后单价",))
-        ensure("总价", "总价", ("总价",))
+        ensure("总价", "总价", ("总价", "金额"))
         ensure("税后总价", "税后总价", ("税后总价",))
-        ensure("品牌", "品牌", ("品牌", "商标"))
-        ensure("制造商", "制造商", ("制造商", "制造商名称", "制造厂家", "厂家", "生产厂家"))
-        ensure("型号", "型号", ("型号", "规格型号"))
-        ensure("产品编码", "产品编码", ("产品编码", "编码", "货号"))
+        ensure("制造商", "报价1制造商", ("报价1制造商", "制造商", "制造商名称", "制造厂家", "厂家", "生产厂家"))
+        ensure("品牌", "报价1品牌", ("报价1品牌", "品牌", "商标"))
+        ensure("型号", "报价1型号", ("报价1型号", "型号", "规格型号"))
+        ensure("产品编码", "报价1产品编码", ("报价1产品编码", "产品编码", "编码", "货号"))
         ensure("单位", "报价单位", ("报价单位", "单位", "计量单位"))
+        for _field, _label in (
+            ("确认单价", "报价1单价"), ("制造商", "报价1制造商"), ("品牌", "报价1品牌"),
+            ("型号", "报价1型号"), ("产品编码", "报价1产品编码"),
+        ):
+            _cell = ws.cell(header_row, assign[_field])
+            if _cell.value != _label:
+                _cell.value = _label
+                _style_export_header(_cell)
         for index in range(2, extra_option_count + 2):
-            ensure(f"报价{index}单价", f"报价{index}单价", (f"报价{index}单价",))
-            ensure(f"报价{index}制造商", f"报价{index}制造商", (f"报价{index}制造商",))
+            for suffix in EXTRA_OPTION_FIELDS:
+                label = f"报价{index}{suffix}"
+                ensure(label, label, (label,))
         if include_internal:
             ensure("匹配状态", "匹配状态", ("匹配状态",))
             ensure("匹配分", "匹配分", ("匹配分",))
@@ -811,35 +870,37 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
                 values["税后单价"] = tax_unit
                 values["总价"] = total
                 values["税后总价"] = round(tax_unit * quantity, 2) if quantity else ""
-                values["品牌"] = _option_field(primary, "brand")
-                values["制造商"] = _option_field(primary, "manufacturer")
-                # “型号”优先取产品编码；历史记录没有编码时回填型号字段（如按
-                # 分类代码报价的行），避免导出型号列空白。
-                code_or_model = _option_field(primary, "product_code") or _option_field(primary, "model")
-                values["型号"] = normalize_standard_code(code_or_model)
-                values["产品编码"] = normalize_standard_code(_option_field(primary, "product_code"))
-                spec_text = _option_field(primary, "spec")
+                values["品牌"] = option_field(primary, "brand")
+                values["制造商"] = option_field(primary, "manufacturer")
+                values["型号"] = normalize_standard_code(option_field(primary, "product_code"))
+                values["产品编码"] = normalize_standard_code(option_field(primary, "product_code"))
+                spec_text = option_field(primary, "spec")
                 if not spec_text and spec_alias_cache is not None and primary.history_quote is not None:
                     spec_text = _fallback_spec(primary.history_quote, line.spec, spec_alias_cache)
                 values[spec_field] = spec_text
-                values["单位"] = line.unit or _option_field(primary, "unit")
+                values["单位"] = line.unit or option_field(primary, "unit")
+            # 与"报价1"同一口径：客户版对未确认行不写价，备选方案列同理留空，
+            # 避免把还没人工确认的候选价泄露到客户版询价单里。
             for index in range(extra_option_count):
                 option = selected[index + 1] if index + 1 < len(selected) else None
-                if option:
-                    values[f"报价{index + 2}单价"] = option.final_price
-                    values[f"报价{index + 2}制造商"] = _option_field(option, "manufacturer")
+                if option and (include_internal or line.confirmed):
+                    prefix = f"报价{index + 2}"
+                    values[f"{prefix}单价"] = option.final_price
+                    values[f"{prefix}制造商"] = option_field(option, "manufacturer")
+                    values[f"{prefix}品牌"] = option_field(option, "brand")
+                    # 与"报价1"口径保持一致：型号与产品编码同取产品编码
+                    # （赛特尔价目本的课标编号就存在这一列）。
+                    code = normalize_standard_code(option_field(option, "product_code"))
+                    values[f"{prefix}型号"] = code
+                    values[f"{prefix}产品编码"] = code
+                    values[f"{prefix}规格"] = option_field(option, "spec")
             if include_internal:
                 values["匹配状态"] = line.status
                 values["匹配分"] = line.recommended_score
                 values["风险提示"] = "；".join(line.warnings or [])
-                values["历史来源"] = _option_source(primary) if primary else ""
+                values["历史来源"] = option_source(primary) if primary else ""
             for field, value in values.items():
-                column = assign[field]
-                cell = ws.cell(row_number, column)
-                # 复用原表列时，已有内容的单元格保持原值，只在空白处补充。
-                if column in reused_columns and cell.value not in (None, ""):
-                    continue
-                cell.value = value
+                cell = ws.cell(row_number, assign[field], value)
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
                 cell.fill = PatternFill(
                     "solid", fgColor="E8F5EE" if line.confirmed else "FFF4CC"

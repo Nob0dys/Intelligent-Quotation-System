@@ -90,8 +90,9 @@ class HistoryQuote(Base):
     quote_date: Mapped[str] = mapped_column(String(40), default="")
     source_priority: Mapped[int] = mapped_column(Integer, default=0)
     data_quality: Mapped[float] = mapped_column(Float, default=0)
-    # NULL = 公共历史库；非空 = 该客户的专属报价单行（仅对所属客户的任务可见）
-    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
+    # 乐观锁：表格编辑提交时带上读取时的 revision，服务端不一致即判冲突。
+    # 每次真正修改业务列都会 +1（见 history_rows.apply_fields）。
+    revision: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -103,6 +104,9 @@ class QuoteJob(Base):
     created_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     file_name: Mapped[str] = mapped_column(String(300))
     display_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # 任务级绑定（B1）：本次报价使用的价目库。为空表示跟随当时的激活库。
+    database_key: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    database_name_snapshot: Mapped[str] = mapped_column(String(120), default="")
     source_file_path: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     progress: Mapped[int] = mapped_column(Integer, default=0)
@@ -175,6 +179,20 @@ class QuoteOption(Base):
     manual_model: Mapped[str | None] = mapped_column(String(300), nullable=True)
     manual_spec: Mapped[str | None] = mapped_column(Text, nullable=True)
     manual_unit: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 匹配时落库的价目快照：跨库报价时 history_quote 关联为空，导出与展示
+    # 只能依赖这份快照（同时也是"报价时点"的价目留痕）。
+    record_source_file: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    record_source_sheet: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    record_source_row: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    record_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    record_spec: Mapped[str | None] = mapped_column(Text, nullable=True)
+    record_model: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    record_brand: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    record_manufacturer: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    record_unit: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    record_product_code: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    record_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    record_quote_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # 回写历史库时保留当时的确认价（避免后续多次覆盖）
     recorded_final_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     line: Mapped[QuoteLine] = relationship(back_populates="options")

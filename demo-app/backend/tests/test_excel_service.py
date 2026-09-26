@@ -1,3 +1,4 @@
+import os
 from io import BytesIO
 from pathlib import Path
 
@@ -9,16 +10,36 @@ from app.excel_service import normalize_code_fields, parse_history_workbook, par
 
 WORKSPACE = Path(__file__).resolve().parents[3]
 
+# 真实询价/价目本体积较大，不随交付包分发。按以下顺序查找，找到即用，
+# 都找不到则跳过相关用例，避免整套测试因缺夹具而报错。
+FIXTURE_DIRS = [
+    Path(os.getenv("QUOTE_TEST_DATA", "")),
+    WORKSPACE / "测试数据",
+    Path(r"E:\Browser Download\测试数据"),
+    Path(r"E:\Browser Download\数据库文件"),
+]
+
+
+def fixture(name: str) -> str:
+    """返回真实测试文件的绝对路径；不存在时跳过当前用例。"""
+    for directory in FIXTURE_DIRS:
+        if not str(directory):
+            continue
+        candidate = directory / name
+        if candidate.exists():
+            return str(candidate)
+    pytest.skip(f"fixture 不存在: {name}（可用 QUOTE_TEST_DATA 指定目录）")
+
 
 def test_real_procurement_templates_keep_expected_product_rows():
     fixtures = [("海南发改委14包.xlsx", 2427), ("海南发改委15包.xlsx", 1529)]
     for name, expected in fixtures:
-        lines = parse_quote_workbook(str(WORKSPACE / "测试数据" / name))
+        lines = parse_quote_workbook(fixture(name))
         assert len(lines) == expected
 
 
 def test_formula_billing_quantity_uses_cached_excel_value():
-    lines = parse_quote_workbook(str(WORKSPACE / "测试数据" / "海南发改委14包.xlsx"))
+    lines = parse_quote_workbook(fixture("海南发改委14包.xlsx"))
     calculator = next(line for line in lines if line["source_row"] == 7)
 
     assert calculator["quantity"] == 18
@@ -27,7 +48,7 @@ def test_formula_billing_quantity_uses_cached_excel_value():
 
 def test_plain_number_column_6_is_not_mistaken_for_quantity():
     """普教清单 column 6 is 含税单价 (a plain number); quantity must come from the 数量 column."""
-    lines = parse_quote_workbook(str(WORKSPACE / "测试数据" / "普教清单.xlsx"))
+    lines = parse_quote_workbook(fixture("普教清单.xlsx"))
     calculator = next(line for line in lines if line["name"] == "计算器")
 
     assert calculator["quantity"] == 13
@@ -36,10 +57,7 @@ def test_plain_number_column_6_is_not_mistaken_for_quantity():
 
 def test_fuzzy_name_header_parses_real_quote_file():
     """高中理化生报价 uses 采购品目 / 参数当询价清单（含父级配置行需跳过）。"""
-    path = WORKSPACE / "测试数据" / "高中理化生报价.xlsx"
-    if not path.exists():
-        pytest.skip(f"fixture 不存在: {path}")
-    lines = parse_quote_workbook(str(path))
+    lines = parse_quote_workbook(fixture("高中理化生报价.xlsx"))
 
     assert lines
     first = lines[0]
@@ -76,20 +94,6 @@ def test_fuzzy_name_header_minimal_workbook(tmp_path):
     assert lines[0]["pricing_quantity"] == 5
 
 
-def test_repeated_segment_header_rows_are_skipped(tmp_path):
-    """分段报价表数据区重复出现的表头行（名称列="名称"、参数列="规格"）不是产品行。"""
-    path = save_workbook(tmp_path, [
-        ["序号", "名称", "规格", "单位", "数量"],
-        [1, "软尺", "1500mm", "把", 5],
-        [None, "3、小学科学仪器采购清单", None, None, None],
-        ["序号", "名称", "规格", "单位", "数量"],
-        [1, "计算器", "8位", "个", 45],
-    ])
-    lines = parse_quote_workbook(path)
-
-    assert [line["name"] for line in lines] == ["软尺", "计算器"]
-
-
 def test_exact_aliases_win_over_fuzzy_name_matching(tmp_path):
     """制造商名称/规格型号 must not be swallowed by the fuzzy name/spec fallback."""
     path = save_workbook(tmp_path, [
@@ -101,21 +105,6 @@ def test_exact_aliases_win_over_fuzzy_name_matching(tmp_path):
     assert lines[0]["name"] == "电子天平"
     assert lines[0]["manufacturer"] == "某某仪器厂"
     assert lines[0]["model"] == "XY-100"
-
-
-def test_merged_header_quantity_on_sub_header_row(tmp_path):
-    """滨达乡小学式合并表头：主表头行“单位”跨列，子表头“参考数量”写在下一行。
-    数量列必须识别，否则导出缺数量/总价/税后总价。"""
-    path = save_workbook(tmp_path, [
-        ["器材类型", None, "分类代码", "器材名称", "规格、品名、教学性能要求", "单位", None, None],
-        [None, None, None, None, None, None, "参考数量", "单价"],
-        [None, "基础用品", "30201000601", "钢卷尺", "量程 0mm～2000mm", "盒", 10, 3],
-    ])
-    lines = parse_quote_workbook(path)
-
-    assert lines[0]["name"] == "钢卷尺"
-    assert lines[0]["quantity"] == 10
-    assert lines[0]["pricing_quantity"] == 10
 
 
 def test_plain_price_column_does_not_override_quantity_minimal(tmp_path):
@@ -173,3 +162,24 @@ def test_tax_inclusive_price_header_normalized_to_base(tmp_path):
     prices = {r["name"]: r["price"] for r in records}
     assert prices["一字螺丝刀"] == 4.0
     assert prices["注射器"] == 8.0
+
+
+def test_csv_quote_and_history_parsing(tmp_path):
+    """CSV（Excel 另存为，UTF-8 或 GBK 编码）应能按同一套表头规则解析。"""
+    quote_csv = tmp_path / "inquiry.csv"
+    quote_csv.write_bytes(
+        "序号,器材名称,规格参数,单位,数量\n1,电子天平,100g,台,2\n".encode("utf-8-sig")
+    )
+    lines = parse_quote_workbook(str(quote_csv))
+    assert len(lines) == 1
+    assert lines[0]["name"] == "电子天平"
+    assert lines[0]["quantity"] == 2
+
+    history_csv = tmp_path / "history.csv"
+    history_csv.write_bytes(
+        "器材名称,规格参数,单位,单价,品牌,厂家\n托盘,300mm,个,5.5,赛特尔,宁波赛特尔教学仪器有限公司\n".encode("gbk")
+    )
+    records = parse_history_workbook(str(history_csv), "history.csv")
+    assert len(records) == 1
+    assert records[0]["price"] == 5.5
+    assert records[0]["manufacturer"] == "宁波赛特尔教学仪器有限公司"

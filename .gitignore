@@ -1,7 +1,21 @@
 .DS_Store
+Thumbs.db
+~$*
 
-# 后端运行时数据（SQLite 数据库 146MB，超过 GitHub 100MB 限制；上传/导出为运行产物）
+# 运行数据与客户数据（价目库 .db、上传/导出件、日志；运行时自动生成，勿入库）
+data/
+!data/.gitkeep
+
+# 后端 Python
+demo-app/backend/.venv/
 demo-app/backend/data/
+__pycache__/
+*.pyc
+.pytest_cache/
 
-# Cloudflare Wrangler 本地构建缓存
+# 前端 Node / 构建缓存
+demo-app/node_modules/
+demo-app/.next/
+demo-app/dist/
 demo-app/.wrangler/
+*.log
