@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 from . import database
 from .database import init_db
@@ -475,7 +475,20 @@ def process_job(job_id: str) -> None:
         db.execute(delete(QuoteLine).where(QuoteLine.job_id == job_id))
         db.commit()
         history_db = _history_session(job)
-        history = [_history_dict(item) for item in history_db.scalars(select(HistoryQuote)).all()]
+        # 显式按 rowid（入库顺序）加载：厂商"首现顺序"映射依赖这个顺序，
+        # 库不变时报价1/2/3 的厂商次序完全可复现。
+        history = [
+            _history_dict(item)
+            for item in history_db.scalars(select(HistoryQuote).order_by(text("rowid"))).all()
+        ]
+        # 厂商首现顺序映射（XJHY 宽表 品牌1/2/3 的列顺序即 赛特尔→瑞仕达→德欧）：
+        # 报价1/2/3 按厂商在价目库中的出现顺序固定输出。无制造商记录不参排，
+        # 恒排在已知厂商之后（赛特尔专库等场景行为与改造前一致）。
+        mfr_appearance: dict[str, int] = {}
+        for item in history:
+            identity = normalize_text(item.get("manufacturer") or item.get("brand"))
+            if identity and identity not in mfr_appearance:
+                mfr_appearance[identity] = len(mfr_appearance)
         # 冷启动预热：把历史库元数据一次性算进 LRU 缓存，后续所有行
         # 的候选池排序/打分全部缓存命中（1675 行 × 全库 ≈ 500 万次
         # 重复解析 → 预热后全部 O(1) 命中）。
@@ -807,7 +820,30 @@ def process_job(job_id: str) -> None:
                     _legacy_sheet_priority(item),
                 )
             )
-            defaults = {item.record["id"] for item in distinct_manufacturer_options(default_pool, job.requested_option_count, min_score=SAITEL_FLOOR)}
+            # 厂商固定顺序：在 default_pool 的质量排序之上，先按厂商首现顺序
+            # 决定"选哪几家"进入默认方案——同一厂商内部仍按名称质量/规格/分数
+            # 取最佳代表记录；未知厂商（无制造商记录）排在已知厂商之后。
+            def _mfr_order(item) -> int:
+                identity = normalize_text(
+                    item.record.get("manufacturer") or item.record.get("brand")
+                )
+                return mfr_appearance.get(identity, len(mfr_appearance))
+
+            mfr_ordered_pool = sorted(
+                default_pool,
+                key=lambda item: (
+                    _mfr_order(item),
+                    -_name_quality(item),
+                    _spec_rank(item),
+                    _catalog_rank(item),
+                    _mismatch_rank(item),
+                    _variant_rank(item),
+                    _grade_rank(item),
+                    -item.score,
+                    _legacy_sheet_priority(item),
+                ),
+            )
+            defaults = {item.record["id"] for item in distinct_manufacturer_options(mfr_ordered_pool, job.requested_option_count, min_score=SAITEL_FLOOR)}
             if suppress_defaults:
                 defaults = set()
             # 默认方案按“同核心词×价位簇×厂商”去重：同品同价位且同一厂商（或厂商
@@ -853,6 +889,7 @@ def process_job(job_id: str) -> None:
                 ),
             )
             ordered_candidates = diversify_price_levels(base_order, defaults, line_core_name)
+            line_options: list[QuoteOption] = []
             for candidate in ordered_candidates:
                 record = candidate.record
                 base_price = candidate.normalized_price or float(record["price"])
@@ -885,23 +922,23 @@ def process_job(job_id: str) -> None:
                     option_warnings.append(
                         f"BLOCK: VIP折扣需核对最低毛利线（{customer.minimum_margin_percent:g}%）"
                     )
-                db.add(
-                    QuoteOption(
-                        line_id=line.id,
-                        history_quote_id=record["id"],
-                        rank=rank,
-                        score=candidate.score,
-                        confidence=candidate.confidence,
-                        component_scores=candidate.component_scores,
-                        reasons=candidate.reasons,
-                        warnings=option_warnings,
-                        unit_status=candidate.unit_status,
-                        normalized_price=candidate.normalized_price,
-                        selected=record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR),
-                        final_price=final_price,
-                        **_record_snapshot(record),
-                    )
+                option = QuoteOption(
+                    line_id=line.id,
+                    history_quote_id=record["id"],
+                    rank=rank,
+                    score=candidate.score,
+                    confidence=candidate.confidence,
+                    component_scores=candidate.component_scores,
+                    reasons=candidate.reasons,
+                    warnings=option_warnings,
+                    unit_status=candidate.unit_status,
+                    normalized_price=candidate.normalized_price,
+                    selected=record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR),
+                    final_price=final_price,
+                    **_record_snapshot(record),
                 )
+                db.add(option)
+                line_options.append(option)
                 if record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR):
                     line_has_selected = True
                     if config_delta and not any("配置加价" in str(w) for w in (line.warnings or [])):
@@ -935,26 +972,42 @@ def process_job(job_id: str) -> None:
                     est_label = "同核心词组低位分位"
                 est_price = round(est_base * (1 - discount / 100), 2)
                 rank += 1
-                db.add(
-                    QuoteOption(
-                        line_id=line.id,
-                        # 估算方案不关联具体历史记录：避免把随机记录（司南）的
-                        # 规格/编码带进导出（曾出现"分子结构模型"参数=司南、单价=1.1）。
-                        history_quote_id=None,
-                        rank=rank,
-                        score=0.0,
-                        confidence="low",
-                        component_scores={},
-                        reasons=["估算"],
-                        warnings=[f"估算价：按{est_label}（¥{est_base:g}）生成，需人工复核"],
-                        unit_status="exact",
-                        normalized_price=None,
-                        # 估算仅供参考，不默认选中——避免垃圾价（1.1 元）写进报价单。
-                        selected=False,
-                        final_price=est_price,
-                    )
+                est_option = QuoteOption(
+                    line_id=line.id,
+                    # 估算方案不关联具体历史记录：避免把随机记录（司南）的
+                    # 规格/编码带进导出（曾出现"分子结构模型"参数=司南、单价=1.1）。
+                    history_quote_id=None,
+                    rank=rank,
+                    score=0.0,
+                    confidence="low",
+                    component_scores={},
+                    reasons=["估算"],
+                    warnings=[f"估算价：按{est_label}（¥{est_base:g}）生成，需人工复核"],
+                    unit_status="exact",
+                    normalized_price=None,
+                    # 估算仅供参考，不默认选中——避免垃圾价（1.1 元）写进报价单。
+                    selected=False,
+                    final_price=est_price,
                 )
+                db.add(est_option)
+                line_options.append(est_option)
                 warnings.append(f"估算价（参考）：按{est_label}生成，需人工复核")
+            # 厂商固定顺序重排 rank：默认选中的方案按厂商在价目库中的首现顺序
+            # 占据 rank 1..N（报价1=首现厂商，如 赛特尔→瑞仕达→德欧），未选中
+            # 方案保持原质量排序紧随其后；库不变则导出列序完全可复现。
+            def _option_mfr_order(opt: QuoteOption) -> int:
+                identity = normalize_text(opt.record_manufacturer or opt.record_brand)
+                return mfr_appearance.get(identity, len(mfr_appearance))
+
+            selected_opts = sorted(
+                (opt for opt in line_options if opt.selected),
+                key=lambda opt: (_option_mfr_order(opt), opt.rank),
+            )
+            unselected_opts = sorted(
+                (opt for opt in line_options if not opt.selected), key=lambda opt: opt.rank
+            )
+            for new_rank, opt in enumerate([*selected_opts, *unselected_opts], start=1):
+                opt.rank = new_rank
             if index % 200 == 0:
                 job.progress = min(95, 5 + int((index + 1) / len(parsed_lines) * 90))
                 db.commit()

@@ -457,6 +457,46 @@ def parse_quote_workbook(path: str) -> list[dict]:
 # ``find_header`` explicitly so quote-sheet parsing is unaffected.
 PRICE_ALIASES = ("单价", "含税单价", "报价", "价格")
 
+# 宽表价目本的编号厂商列组（品牌1/厂家1/型号1、品牌2/…）：表头识别阶段按组
+# 收集，数据行每组拆成一条价目记录，口径与离线脚本 xjhy_wide_to_long.py 一致。
+VENDOR_GROUP_RES = (
+    ("brand", re.compile(r"^(品牌|商标)(\d+)?$")),
+    ("manufacturer", re.compile(r"^(厂家|生产厂家|制造商|制造厂家|制造商名称|制造商/产地)(\d+)?$")),
+    ("model", re.compile(r"^(型号|规格型号)(\d+)?$")),
+)
+
+
+def _vendor_groups(values: list[str], columns: dict[str, int]) -> list[dict[str, int]]:
+    """Collect numbered vendor column groups (品牌1/厂家1/型号1 …) from a header.
+
+    ``values`` are the normalized header labels; ``columns`` the fields already
+    claimed by HEADER_ALIASES.  Returns group dicts ordered ""（无编号组）、
+    1、2、3…；返回空列表表示该 sheet 是常规单厂商表，走原有解析路径。
+    """
+    claimed = {index for index in columns.values() if index}
+    groups: dict[str, dict[str, int]] = {}
+    for index, value in enumerate(values, start=1):
+        if not value or index in claimed:
+            continue
+        for field, regex in VENDOR_GROUP_RES:
+            match = regex.match(value)
+            if match:
+                groups.setdefault(match.group(2) or "", {})[field] = index
+                break
+    if not any(suffix for suffix in groups):
+        return []
+    base = {field: columns.get(field, 0) for field in ("brand", "manufacturer", "model")}
+    if any(base.values()):
+        groups.setdefault("", {}).update({k: v for k, v in base.items() if v})
+
+    def _sort_key(suffix: str) -> tuple[int, int]:
+        return (0, 0) if suffix == "" else (1, int(suffix))
+
+    return [
+        {**groups[suffix], "suffix": suffix or "0"}
+        for suffix in sorted(groups, key=_sort_key)
+    ]
+
 # 历史价表中"含税单价"类表头的固定含税率（普教清单等），导入时折回税前基准。
 TAX_INCLUSIVE_RATE = float(os.getenv("HISTORY_TAX_RATE", "0.10"))
 
@@ -483,6 +523,11 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
             price_column_found = True
         elif not (columns.get("name") and (columns.get("spec") or columns.get("unit"))):
             continue
+        # 宽表价目本（品牌1/厂家1/型号1、品牌2/…）：识别编号厂商列组。
+        vendor_groups = _vendor_groups(
+            [normalize_header_key(ws.cell(header_row, c)) for c in range(1, ws.max_column + 1)],
+            columns,
+        )
         # “含税单价/含税价格”类表头按固定含税率折回税前基准，避免导出再乘税（双重计税）。
         # 注意 “不含税单价” 也含 “含税” 子串，必须先排除 “不含”。
         price_label = cell_text(ws.cell(header_row, columns["price"])) if has_price_column else ""
@@ -496,6 +541,10 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
                     new_header = find_header(ws, {"price": PRICE_ALIASES}, start_row=row_number)
                     if new_header and new_header[1].get("price"):
                         header_row, columns = new_header
+                        vendor_groups = _vendor_groups(
+                            [normalize_header_key(ws.cell(header_row, c)) for c in range(1, ws.max_column + 1)],
+                            columns,
+                        )
                         price_label = cell_text(ws.cell(header_row, columns["price"]))
                         tax_inclusive = ("含税" in price_label) and ("不含" not in price_label)
                 continue
@@ -505,18 +554,38 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
             price = number_value(ws.cell(row_number, columns["price"])) if has_price_column else None
             if tax_inclusive and price:
                 price = round(price / (1 + TAX_INCLUSIVE_RATE), 2)
-            record = {
+            base_record = {
                 "sheet_name": ws.title,
                 "source_row": row_number,
                 "name": name,
                 "spec": cell_text(ws.cell(row_number, columns["spec"])) if columns.get("spec") else "",
                 "product_code": cell_text(ws.cell(row_number, columns["product_code"])) if columns.get("product_code") else "",
-                "model": cell_text(ws.cell(row_number, columns["model"])) if columns.get("model") else "",
-                "brand": cell_text(ws.cell(row_number, columns["brand"])) if columns.get("brand") else "",
-                "manufacturer": cell_text(ws.cell(row_number, columns["manufacturer"])) if columns.get("manufacturer") else "",
                 "unit": cell_text(ws.cell(row_number, columns["unit"])) if columns.get("unit") else "",
                 "price": price,
                 "has_price_column": has_price_column,
+            }
+            if vendor_groups:
+                # 宽表：每个厂商列组（品牌或厂家非空）拆成一条独立价目记录。
+                emitted = 0
+                for group in vendor_groups:
+                    brand = cell_text(ws.cell(row_number, group["brand"])) if group.get("brand") else ""
+                    manufacturer = cell_text(ws.cell(row_number, group["manufacturer"])) if group.get("manufacturer") else ""
+                    model = cell_text(ws.cell(row_number, group["model"])) if group.get("model") else ""
+                    if not (brand or manufacturer or model):
+                        continue
+                    records.append(normalize_code_fields({
+                        **base_record, "brand": brand, "manufacturer": manufacturer, "model": model,
+                        # 同一源行拆出多条记录：厂商组号进 id 后缀，避免主键冲突。
+                        "vendor_group": group["suffix"],
+                    }))
+                    emitted += 1
+                if emitted:
+                    continue
+            record = {
+                **base_record,
+                "model": cell_text(ws.cell(row_number, columns["model"])) if columns.get("model") else "",
+                "brand": cell_text(ws.cell(row_number, columns["brand"])) if columns.get("brand") else "",
+                "manufacturer": cell_text(ws.cell(row_number, columns["manufacturer"])) if columns.get("manufacturer") else "",
             }
             records.append(normalize_code_fields(record))
     workbook.close()
@@ -872,7 +941,11 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
                 values["税后总价"] = round(tax_unit * quantity, 2) if quantity else ""
                 values["品牌"] = option_field(primary, "brand")
                 values["制造商"] = option_field(primary, "manufacturer")
-                values["型号"] = normalize_standard_code(option_field(primary, "product_code"))
+                # “型号”优先取产品编码；历史记录没有编码时回填型号字段——
+                # XJHY 价目库的 11 位课标编码存在 model 列（normalize_code_fields
+                # 只归位 5 位编码），只读 product_code 会让型号列整列空白。
+                code_or_model = option_field(primary, "product_code") or option_field(primary, "model")
+                values["型号"] = normalize_standard_code(code_or_model)
                 values["产品编码"] = normalize_standard_code(option_field(primary, "product_code"))
                 spec_text = option_field(primary, "spec")
                 if not spec_text and spec_alias_cache is not None and primary.history_quote is not None:
@@ -888,11 +961,13 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
                     values[f"{prefix}单价"] = option.final_price
                     values[f"{prefix}制造商"] = option_field(option, "manufacturer")
                     values[f"{prefix}品牌"] = option_field(option, "brand")
-                    # 与"报价1"口径保持一致：型号与产品编码同取产品编码
-                    # （赛特尔价目本的课标编号就存在这一列）。
-                    code = normalize_standard_code(option_field(option, "product_code"))
+                    # 与"报价1"口径保持一致：型号 = 产品编码，缺失时回填型号字段
+                    # （XJHY 价目库的 11 位课标编码存在型号列）。
+                    code = normalize_standard_code(
+                        option_field(option, "product_code") or option_field(option, "model")
+                    )
                     values[f"{prefix}型号"] = code
-                    values[f"{prefix}产品编码"] = code
+                    values[f"{prefix}产品编码"] = normalize_standard_code(option_field(option, "product_code"))
                     values[f"{prefix}规格"] = option_field(option, "spec")
             if include_internal:
                 values["匹配状态"] = line.status

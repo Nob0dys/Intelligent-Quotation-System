@@ -183,3 +183,68 @@ def test_csv_quote_and_history_parsing(tmp_path):
     assert len(records) == 1
     assert records[0]["price"] == 5.5
     assert records[0]["manufacturer"] == "宁波赛特尔教学仪器有限公司"
+
+
+def save_history_workbook(tmp_path, rows) -> str:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "价目"
+    for row in rows:
+        sheet.append(row)
+    stream = BytesIO()
+    workbook.save(stream)
+    path = tmp_path / "history.xlsx"
+    path.write_bytes(stream.getvalue())
+    return str(path)
+
+
+def test_wide_vendor_groups_import_as_separate_records(tmp_path):
+    """宽表价目本（品牌1/厂家1/型号1、品牌2/…）一行拆成多厂商记录。"""
+    path = save_history_workbook(tmp_path, [
+        ["序号", "器材名称", "规格参数", "单位", "数量", "单价",
+         "品牌1", "厂家1", "型号1", "品牌2", "厂家2", "型号2"],
+        [1, "工作服", "涤卡材质", "件", 50, 35,
+         "赛特尔", "宁波赛特尔教学仪器有限公司", "30802000110",
+         "瑞仕达", "宁波瑞仕达教学仪器有限公司", "30802000110"],
+        [2, "乳胶手套", "耐酸碱", "双", 50, 9,
+         "赛特尔", "宁波赛特尔教学仪器有限公司", "30802000503",
+         "", "", ""],
+    ])
+    records = parse_history_workbook(path, "wide.xlsx")
+    assert len(records) == 3  # 第 2 行第 2 厂商组为空，只产出 1 条
+    first, second = records[0], records[1]
+    assert first["brand"] == "赛特尔" and first["manufacturer"].startswith("宁波赛特尔")
+    assert second["brand"] == "瑞仕达" and second["manufacturer"].startswith("宁波瑞仕达")
+    assert first["price"] == second["price"] == 35
+    assert first["name"] == second["name"] == "工作服"
+    # 5 位以外的编码保留在型号列（normalize_code_fields 只归位 5 位 JY 编码）
+    assert first["model"] == "30802000110"
+    assert records[2]["name"] == "乳胶手套" and records[2]["brand"] == "赛特尔"
+
+
+def test_unnumbered_vendor_columns_stay_single_record(tmp_path):
+    """单厂商表（无编号列组）维持原解析路径，一行一记录。"""
+    path = save_history_workbook(tmp_path, [
+        ["序号", "器材名称", "规格参数", "单位", "单价", "品牌", "厂家", "型号"],
+        [1, "工作服", "涤卡材质", "件", 35, "赛特尔", "宁波赛特尔教学仪器有限公司", "30802000110"],
+    ])
+    records = parse_history_workbook(path, "single.xlsx")
+    assert len(records) == 1
+    assert records[0]["manufacturer"].startswith("宁波赛特尔")
+    assert records[0]["model"] == "30802000110"
+
+
+def test_real_xjhy_wide_workbook_imports_all_vendors():
+    """真实 XJHY 宽表：全厂商入库且首现顺序 赛特尔→瑞仕达→德欧。"""
+    records = parse_history_workbook(fixture("副本XJHY数据库.xlsx"), "副本XJHY数据库.xlsx")
+    assert len(records) >= 14410  # 不低于离线长表转换导入的记录量
+    seen: list[str] = []
+    for record in records:
+        identity = record["manufacturer"] or record["brand"]
+        if identity and identity not in seen:
+            seen.append(identity)
+    assert seen[:3] == [
+        "宁波赛特尔教学仪器有限公司",
+        "宁波瑞仕达教学仪器有限公司",
+        "余姚市德欧教学仪器厂",
+    ]

@@ -571,3 +571,69 @@ def test_manual_history_entry_requires_admin():
         login(client, "quote", "quote123")
         response = client.post("/api/history", json={"name": "越权记录", "price": 10})
         assert response.status_code == 403
+
+
+def _insert_history(records: list[dict], prefix: str = "test-history") -> None:
+    """直接往测试库插历史价目记录（派生列由 build_history_row 统一算）。"""
+    from app.history_rows import build_history_row
+
+    with SessionLocal() as db:
+        for index, record in enumerate(records, start=1):
+            db.add(build_history_row(
+                record.get("id") or f"{prefix}.xlsx:测试:{index}",
+                source_file=record.get("source_file", f"{prefix}.xlsx"),
+                source_sheet="测试",
+                source_row=index,
+                name=record["name"],
+                spec=record.get("spec", ""),
+                product_code=record.get("product_code", ""),
+                model=record.get("model", ""),
+                brand=record.get("brand", ""),
+                manufacturer=record.get("manufacturer", ""),
+                unit=record.get("unit", "台"),
+                quantity=1,
+                price=record.get("price", 100.0),
+                quote_date="2026-01-01",
+            ))
+        db.commit()
+
+
+def test_selected_options_follow_manufacturer_appearance_order():
+    """报价1/2/3 按厂商在价目库中的首现顺序固定，而非匹配分数先后。"""
+    with TestClient(app) as client:
+        login(client)
+        # 乙厂先入库（首现顺序靠前），甲厂后入库但参数与询价完全一致（分数更高）；
+        # 旧逻辑按分数会把甲厂排到报价1，新逻辑必须保持乙厂在前。
+        _insert_history([
+            {"name": "顺序验证仪", "spec": "量程100g", "manufacturer": "乙厂", "brand": "乙", "price": 100.0},
+            {"name": "顺序验证仪", "spec": "量程100g，精度0.001g", "manufacturer": "甲厂", "brand": "甲", "price": 100.0},
+        ], prefix="mfr-order")
+        content = workbook_bytes([[1, "顺序验证仪", "量程100g，精度0.001g", "", "台", 1]])
+        job_id = create_job(client, ordinary_customer_id(client), content, option_count=3)
+        lines = client.get(f"/api/quote-jobs/{job_id}/lines").json()
+        line = client.get(f"/api/quote-lines/{lines['items'][0]['id']}").json()
+        selected = sorted((o for o in line["options"] if o["selected"]), key=lambda o: o["rank"])
+        assert len(selected) >= 2
+        assert selected[0]["record"]["manufacturer"] == "乙厂"
+        assert selected[1]["record"]["manufacturer"] == "甲厂"
+
+
+def test_export_model_falls_back_to_history_model_field():
+    """历史记录无产品编码时，型号列回填型号字段（XJHY 11 位课标编码场景）。"""
+    with TestClient(app) as client:
+        login(client)
+        _insert_history([
+            {"name": "型号验证仪", "spec": "量程200g", "manufacturer": "甲厂", "brand": "甲",
+             "model": "30802000503", "product_code": "", "price": 88.0},
+        ], prefix="model-fallback")
+        content = workbook_bytes([[1, "型号验证仪", "量程200g", "", "台", 1]])
+        job_id = create_job(client, ordinary_customer_id(client), content, option_count=1)
+        response = client.post(f"/api/quote-jobs/{job_id}/export/internal")
+        assert response.status_code == 200, response.text
+        workbook = load_workbook(BytesIO(response.content))
+        sheet = workbook["询价单"]
+        headers = [cell.value for cell in sheet[1]]
+        model_col = headers.index("报价1型号") + 1
+        code_col = headers.index("报价1产品编码") + 1
+        assert sheet.cell(2, model_col).value == "30802000503"
+        assert not sheet.cell(2, code_col).value

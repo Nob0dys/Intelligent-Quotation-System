@@ -2395,6 +2395,9 @@ def _insert_history_rows(db: Session, rows: list[dict], original_name: str, user
             continue
         seen_keys.add(key)
         record_id = f"{original_name}:{row['sheet_name']}:{row['source_row']}"
+        if row.get("vendor_group"):
+            # 宽表一行拆多厂商记录：同一 source_row 用厂商组号区分主键。
+            record_id = f"{record_id}#{row['vendor_group']}"
         if db.get(HistoryQuote, record_id):
             skipped_duplicates += 1
             continue
