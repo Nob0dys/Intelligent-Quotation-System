@@ -1,11 +1,17 @@
 import os
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
-from app.excel_service import normalize_code_fields, parse_history_workbook, parse_quote_workbook
+from app.excel_service import (
+    create_export,
+    normalize_code_fields,
+    parse_history_workbook,
+    parse_quote_workbook,
+)
 
 
 WORKSPACE = Path(__file__).resolve().parents[3]
@@ -32,7 +38,9 @@ def fixture(name: str) -> str:
 
 
 def test_real_procurement_templates_keep_expected_product_rows():
-    fixtures = [("海南发改委14包.xlsx", 2427), ("海南发改委15包.xlsx", 1529)]
+    # 14包 由 2427 修正为 2428：凯迪 sheet 第 1805 行「老师端探究设备」
+    # （数量 52 座、规格列为空）此前被误当作空行丢弃，现已正常保留。
+    fixtures = [("海南发改委14包.xlsx", 2428), ("海南发改委15包.xlsx", 1529)]
     for name, expected in fixtures:
         lines = parse_quote_workbook(fixture(name))
         assert len(lines) == expected
@@ -116,6 +124,113 @@ def test_plain_price_column_does_not_override_quantity_minimal(tmp_path):
 
     assert lines[0]["quantity"] == 13
     assert lines[0]["pricing_quantity"] == 13
+
+
+def _stub_option(**kwargs):
+    base = dict(
+        selected=True,
+        rank=1,
+        score=50.0,
+        final_price=10.0,
+        warnings=[],
+        history_quote=None,
+        record_brand="",
+        record_manufacturer="",
+        record_model="",
+        record_product_code="",
+        record_spec="",
+        record_unit="",
+        record_source_file="",
+        record_source_sheet="",
+        record_source_row=0,
+        manual_brand="",
+        manual_manufacturer="",
+        manual_model="",
+        manual_spec="",
+        manual_unit="",
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+def _stub_line(**kwargs):
+    base = dict(
+        sheet_name="Sheet1",
+        source_row=3,
+        name="x",
+        spec="",
+        unit="只",
+        quantity=1.0,
+        pricing_quantity=1.0,
+        status="review",
+        recommended_score=0.0,
+        warnings=[],
+        confirmed=False,
+        options=[],
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+def test_export_header_uses_source_header_row_not_first_matched_row(tmp_path):
+    """导出的报价列表头必须落在源表真正的表头行（此处第 2 行）。
+
+    历史实现取 ``min(source_row) - 1``：源表开头若有未被解析成数据行的行，
+    表头就会压到某条数据行上（表头错位、该行原有内容被覆盖）。
+    """
+    src = tmp_path / "quote.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Sheet1"
+    sheet.append(["采购物理器材清单(2026.09)"])                 # 第 1 行：标题
+    sheet.append(["序号", "器材名称", "规格参数", "单位", "数量"])  # 第 2 行：表头
+    sheet.append([1, "机械停表", None, "只", 6])                # 第 3 行：数据
+    sheet.append([2, "液体内部压强演示器", "J2113型", "套", 6])   # 第 4 行：数据
+    workbook.save(src)
+
+    job = SimpleNamespace(
+        tax_rate=0.10,
+        source_file_path=str(src),
+        requested_option_count=1,
+        lines=[
+            _stub_line(source_row=3, name="机械停表", options=[_stub_option()]),
+            _stub_line(source_row=4, name="液体内部压强演示器", spec="J2113型", unit="套",
+                       options=[_stub_option()]),
+        ],
+    )
+    output = tmp_path / "out.xlsx"
+    create_export(job, "internal", str(output))
+
+    result = load_workbook(output)
+    exported = result["Sheet1"]
+    assert exported.cell(2, 1).value == "序号"        # 原表头完好，未被数据行顶替
+    assert exported.cell(2, 6).value == "报价1单价"    # 新增报价列同样在第 2 行
+    assert exported.cell(3, 1).value == 1             # 第 3 行仍是数据行
+    assert exported.cell(3, 6).value == 10.0
+    assert exported.cell(4, 1).value == 2
+    result.close()
+
+
+def test_spec_less_product_row_with_quantity_is_kept(tmp_path):
+    """只有名称 + 数量、规格列为空的询价行必须保留。
+
+    采购清单常整行不写规格（如（启明）2026秋采购器材），若按"有规格才算出产品行"
+    过滤，这些商品会静默丢失、导出后整条不报价；同时它们还导致导出的表头行
+    定位错误。真正该跳过的是"既无规格/编码/厂商、又无数量"的空行。
+    """
+    path = save_workbook(tmp_path, [
+        ["序号", "器材名称", "规格参数", "单位", "数量"],
+        [1, "机械停表", None, "只", 6],
+        [2, "演示温度计", None, "只", 2],
+        [3, "液体内部压强演示器", "J2113型", "套", 6],
+        [4, "以下空白", None, None, None],  # 名称有内容但无数量 → 仍按空行跳过
+    ])
+    lines = parse_quote_workbook(path)
+
+    assert [line["name"] for line in lines] == ["机械停表", "演示温度计", "液体内部压强演示器"]
+    assert lines[0]["spec"] == ""
+    assert lines[0]["quantity"] == 6
+    assert lines[1]["quantity"] == 2
 
 
 def test_five_digit_model_is_moved_to_product_code():

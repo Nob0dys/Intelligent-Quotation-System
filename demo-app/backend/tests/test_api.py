@@ -138,3 +138,51 @@ def test_special_customer_requires_structured_requirement():
         )
 
         assert response.status_code == 422
+
+
+def _job_option_counts(client: TestClient, job_id: str) -> tuple[int, int, int]:
+    """返回 (方案总数, 选中方案数, 行数)。
+
+    不能按 option id 比对：SQLite 的 INTEGER PRIMARY KEY 会回收被删行的 id，
+    表被清空后新行又从 1 开始编号，新旧 id 天然重叠。规模才是可靠信号——
+    若旧选项没被清掉，它们会挂到新行上，方案总数随之膨胀。
+    """
+    total = selected = 0
+    lines = client.get(f"/api/quote-jobs/{job_id}/lines", params={"page": 1, "page_size": 100}).json()
+    for item in lines["items"]:
+        detail = client.get(f"/api/quote-lines/{item['id']}").json()
+        total += len(detail["options"])
+        selected += sum(1 for option in detail["options"] if option["selected"])
+    return total, selected, len(lines["items"])
+
+
+def test_reprocess_drops_previous_options_instead_of_rebinding_them():
+    """重新匹配必须连同上一轮的 quote_options 一起清掉。
+
+    process_job 只删 quote_lines 时，旧选项会成为悬挂行；其 line_id 随后被回收
+    给新行，上一轮的旧候选就被重新挂到本轮的新行上——同一行出现两份"选中的方案"，
+    导出时张冠李戴（错位 / 重复）。
+    """
+    with TestClient(app) as client:
+        login(client)
+        response = client.post(
+            "/api/quote-jobs",
+            data={"requested_option_count": 1},
+            files={"file": (
+                "询价.xlsx",
+                workbook_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )},
+        )
+        assert response.status_code == 202, response.text
+        job_id = response.json()["id"]
+
+        first = _job_option_counts(client, job_id)
+        assert first[0] > 0, "首轮匹配应产生候选方案"
+
+        reprocess = client.post(f"/api/quote-jobs/{job_id}/reprocess")
+        assert reprocess.status_code == 202, reprocess.text
+
+        second = _job_option_counts(client, job_id)
+        assert second[0] > 0, "重新匹配后仍应有候选方案"
+        assert second == first, f"重新匹配后方案规模变化（残留上一轮旧选项）: {first} -> {second}"

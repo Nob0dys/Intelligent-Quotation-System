@@ -403,9 +403,17 @@ def parse_quote_workbook(path: str) -> list[dict]:
                 for field, column in columns.items()
                 if field not in ("name", "quantity")
             }
-            if not spec and not any(values.get(field) for field in ("product_code", "model", "brand", "manufacturer")):
-                continue
             quantity = number_value(ws.cell(row_number, columns["quantity"])) if columns["quantity"] else None
+            # 只凭“有规格/编码/厂商”判定产品行会误杀“只有名称 + 数量”的询价行
+            # （如（启明）2026秋采购器材这类清单，32 行里有 8 行规格列为空），
+            # 这些行同样要报价、要在导出表里占位。因此只要该行带数量就保留，
+            # 仅当既无规格/编码/厂商、又无数量时才当作空行跳过。
+            if (
+                not spec
+                and not any(values.get(field) for field in ("product_code", "model", "brand", "manufacturer"))
+                and not quantity
+            ):
+                continue
             # 部分询价表把“数量/单位”两列写反（单位列填数字、数量列填单位词），
             # 按语义交换，避免导出缺数量/总价/税后总价。
             if (
@@ -831,7 +839,12 @@ def create_export(job, variant: str, output_path: str, db=None) -> str:
         relevant = [line for line in job.lines if line.sheet_name == ws.title]
         if not relevant:
             continue
-        header_row = max(1, min(line.source_row for line in relevant) - 1)
+        # 表头行取自源表自身的表头识别，而不是"第一条已匹配数据行 - 1"。
+        # 若源表开头存在未解析成数据行的行（例如规格列为空的询价行），
+        # min(source_row) - 1 会落到某条数据行上，导出的报价列表头便整排错位、
+        # 且错位行原有内容被表头覆盖。
+        detected = find_header(ws)
+        header_row = detected[0] if detected else max(1, min(line.source_row for line in relevant) - 1)
         # 列组按"实际会写出的最大方案数"生成：客户版只写已确认行，内部复核版写全部行。
         # 若把未确认行也计入，它们自动带出的备选方案会撑出一整组没人写入的空列；
         # 同时也不超过任务请求的方案数。

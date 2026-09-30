@@ -472,6 +472,16 @@ def process_job(job_id: str) -> None:
         job.error_message = ""
         db.commit()
         parsed_lines = parse_quote_workbook(job.source_file_path)
+        # 重新匹配前必须先删旧选项、再删旧行。SQLite 未开启 foreign_keys，
+        # ON DELETE CASCADE 不生效；且 delete() 是绕过 ORM 的批量删除，不会触发
+        # relationship 的 cascade。只删 quote_lines 会留下悬挂的 quote_options，
+        # 其 line_id 随后被回收给新行，上一轮的旧候选就被重新挂到本轮的新行上，
+        # 导出时"选中的方案"张冠李戴（错位/重复）。
+        db.execute(
+            delete(QuoteOption).where(
+                QuoteOption.line_id.in_(select(QuoteLine.id).where(QuoteLine.job_id == job_id))
+            )
+        )
         db.execute(delete(QuoteLine).where(QuoteLine.job_id == job_id))
         db.commit()
         history_db = _history_session(job)
